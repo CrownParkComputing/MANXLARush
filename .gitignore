@@ -1,0 +1,12 @@
+/build*/
+/game_data/
+/larush_extracted/
+*.xbe
+*.iso
+*.rar
+*.zip
+*.7z
+fgui_report.json
+*.log
+__pycache__/
+*.pyc
