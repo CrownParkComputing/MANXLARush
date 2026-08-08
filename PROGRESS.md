@@ -1,6 +1,6 @@
 # L.A. Rush — Native recompilation progress
 
-**Updated:** 8 August 2026
+**Updated:** 8 August 2026 (second pass)
 **Primary milestone:** render retail L.A. Rush art via the shared D3D8→Vulkan
 backend, loading assets from the k9 archives.
 
@@ -85,16 +85,34 @@ XBE header fields:
       texture from `frontend.res` and displays it
 - [x] Entry-path analysis: `lar_disas.py` confirms direct CRT entry at
       `0x001B2594` (not an init table)
+- [x] Tracer fixed (Capstone operand-type constants were wrong — every
+      call target was invisible; also now follows both arms of
+      conditional branches and traces pushed code pointers as callback
+      roots).  Full CRT chain recovered: entry `0x001B2594` →
+      CreateThread `0x001B7557` (PsCreateSystemThreadEx, ordinal 255) →
+      trampoline `0x001B74BF` (TLS attach, PsTerminateSystemThread 258)
+      → mainCRTStartup `0x001B2520` → **main = `0x00087860`** →
+      exit `0x001B6CE6` (launch-data page, HalReturnToFirmware 49)
+- [x] Hand-recompiled CRT entry chain (`src/larush_crt.c`): certificate
+      clamp, TLS slab sizing/attach (`[0x486834]`, index = size/−4),
+      Xapi process init (PeHeapReserve/Commit, InitFlags), all three
+      initializer-table walks, native-recompile registry, main dispatch.
+      `LARushCRTTest` verifies every written value against an
+      independent recomputation from the retail image; synthetic
+      `--self-test` runs in ctest with no game data
+- [ ] Recompile `main` (`0x00087860`, 205 insns) and the C++ static
+      ctor table (**2,228 live initializers** at `0x002D5DB0–0x002D8084`)
+      through the native registry toward a running game loop
 - [ ] Full `.res` texture-package descriptor doc + per-mip extraction
 - [ ] XACT (`.xsb`/`.xwb`) audio + XMV/WMA FMV via `MANXFramework::FMV`
-- [ ] Hand-recompile the CRT entry chain from `0x001B2594` through the
-      `g_eax`/`STACK_ARG` model toward a running game loop
 - [ ] Give the 17 new kernel ordinals real semantics from call-site disasm
 
 ## Key files
 
 | File | Purpose |
 |---|---|
+| `src/larush_crt.c/.h` | hand-recompiled CRT entry chain (entry → TLS → ctor walks → main dispatch) |
+| `tools/larush_crt_test.c` | CRT chain diagnostic: retail cross-check + synthetic self-test |
 | `src/larush_kernel_shim.c` | Xbox kernel layer (thunk table 0x002BFF48×256, stubs, dispatch) |
 | `src/larush_first_boot.c` | XBE loader + kernel init + ordinal diagnostic + synthetic self-test |
 | `src/larush_k9_vfs.c/.h` | k9 archive VFS: k9CP zlib codec + archive-layer seam |
@@ -111,25 +129,29 @@ XBE header fields:
 
 ```bash
 cmake -S . -B build && cmake --build build -j$(nproc)
-ctest --test-dir build --output-on-failure   # 3 tests, no game data needed
+ctest --test-dir build --output-on-failure   # 4 tests, no game data needed
 
 ./build/LARushD3DProbe --no-xbe   # Vulkan clear/readback smoke test
 ./build/LARushBoot                # SDL3 window, procedural placeholder
 ./build/LARushK9Test <file-or-dir>  # classify k9/XPR/XACT data
 
-# Stage B (once game data is supplied):
+# Stage B (retail data):
 ./build/LARushFirstBoot game_data/L.A.Rush.USA.XBOX-ZTM
+./build/LARushCRTTest   game_data/L.A.Rush.USA.XBOX-ZTM   # CRT chain cross-check
 ./build/LARushD3DProbe  game_data/L.A.Rush.USA.XBOX-ZTM
+./build/LARushBoot --dump title.ppm    # headless real-art frame dump
 python3 tools/lar_disas.py game_data/L.A.Rush.USA.XBOX-ZTM/default.xbe
 ```
 
 ## Open questions
 
-1. Entry `0x00010184` is ~0x184 past the image base — direct CRT code, or
-   header-page thunk?  `lar_disas.py` probes both hypotheses (B7).
-2. `KERNEL_SYNTH_BASE 0x00F00000` / `KDATA_BASE 0x00F10000` must be
-   confirmed against the real section map (B1).
-3. k9CP codec: zlib assumption is validated only against synthetic data;
-   `LARushK9Test` reports the verdict the moment a retail `.k9z` is seen.
+1. ~~Entry direct code vs header-page thunk~~ — resolved: `0x001B2594`
+   is direct CRT code; the full chain to `main = 0x00087860` is mapped.
+2. ~~Synth/KDATA VA placement~~ — confirmed clear of the 19-section
+   image (top `0x00497760`).
+3. ~~k9CP codec~~ — confirmed plain zlib against retail `.k9z` archives.
 4. Do DSOUND/XACTENG/XONLINE imply early audio/net ordinal traffic during
    boot (more stubs needed than FlatOut's first boot required)?
+5. Which of the 2,228 static ctors gate `main`'s early calls?  Cluster
+   them by section/VA range and recompile on demand as main's call
+   graph is ported.

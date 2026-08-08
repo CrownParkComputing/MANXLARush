@@ -22,6 +22,7 @@ find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
 
 add_library(larush_port STATIC
+    src/larush_crt.c
     src/larush_k9_vfs.c
     src/larush_kernel_shim.c)
 target_include_directories(larush_port PUBLIC src)
@@ -46,15 +47,19 @@ add_executable(LARushBoot tools/larush_boot.c)
 target_include_directories(LARushBoot PRIVATE tools)
 target_link_libraries(LARushBoot PRIVATE larush_port SDL3::SDL3)
 
+add_executable(LARushCRTTest tools/larush_crt_test.c)
+target_link_libraries(LARushCRTTest PRIVATE larush_port)
+
 enable_testing()
 add_executable(larush_k9_unit_test tests/larush_k9_unit_test.c)
 target_link_libraries(larush_k9_unit_test PRIVATE larush_port)
 add_test(NAME larush_k9_unit_test COMMAND larush_k9_unit_test)
 add_test(NAME larush_xbe_parser_test COMMAND LARushProbe --self-test)
 add_test(NAME larush_first_boot_self_test COMMAND LARushFirstBoot --self-test)
+add_test(NAME larush_crt_self_test COMMAND LARushCRTTest --self-test)
 
 foreach(target LARushProbe LARushFirstBoot LARushD3DProbe LARushK9Test
-               LARushBoot larush_k9_unit_test)
+               LARushBoot LARushCRTTest larush_k9_unit_test)
     target_compile_options(${target} PRIVATE
         -O2 -Wall -Wextra -Wpedantic -UNDEBUG -Wno-unused-function)
 endforeach()

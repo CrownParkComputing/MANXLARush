@@ -8,7 +8,9 @@
 // visualiser renders a procedural L.A. Rush sunset-orange placeholder —
 // which still proves the SDL3 window + texture upload path end to end.
 //
-// Usage: ./LARushBoot [game_data/L.A.Rush.USA.XBOX-ZTM]
+// Usage: ./LARushBoot [game_data/L.A.Rush.USA.XBOX-ZTM] [--dump out.ppm]
+//        --dump writes the decoded frame as binary PPM and exits without
+//        opening a window (headless verification).
 
 #include "larush_k9_vfs.h"
 
@@ -144,9 +146,27 @@ static uint32_t *make_placeholder(int w, int h) {
     return px;
 }
 
+static int dump_ppm(const char *path, const uint32_t *px, int w, int h) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+    fprintf(f, "P6\n%d %d\n255\n", w, h);
+    for (int i = 0; i < w * h; i++) {
+        uint8_t rgb[3] = { (uint8_t)(px[i] >> 24), (uint8_t)(px[i] >> 16),
+                           (uint8_t)(px[i] >> 8) };
+        fwrite(rgb, 1, 3, f);
+    }
+    return fclose(f) == 0;
+}
+
 int main(int argc, char **argv) {
-    const char *data_dir = argc > 1 ? argv[1]
-        : "game_data/L.A.Rush.USA.XBOX-ZTM";
+    const char *data_dir = "game_data/L.A.Rush.USA.XBOX-ZTM";
+    const char *dump_path = NULL;
+    for (int a = 1; a < argc; a++) {
+        if (strcmp(argv[a], "--dump") == 0 && a + 1 < argc)
+            dump_path = argv[++a];
+        else
+            data_dir = argv[a];
+    }
 
     k9_texture tex_info = {0};
     const char *loaded = NULL;
@@ -203,6 +223,21 @@ int main(int argc, char **argv) {
         if (!loaded) { larush_k9_close(k9); k9 = NULL; }
     }
     (void)tex_info;
+
+    if (dump_path) {
+        int ok = 0;
+        if (decoded_pixels)
+            ok = dump_ppm(dump_path, decoded_pixels, tex_w, tex_h);
+        else {
+            uint32_t *ph = make_placeholder(tex_w, tex_h);
+            if (ph) { ok = dump_ppm(dump_path, ph, tex_w, tex_h); free(ph); }
+        }
+        printf("%s frame -> %s (%dx%d, %s)\n", ok ? "Dumped" : "FAILED to dump",
+               dump_path, tex_w, tex_h, loaded ? loaded : "placeholder");
+        free(decoded_pixels);
+        if (k9) larush_k9_close(k9);
+        return ok ? 0 : 1;
+    }
 
     /* Init SDL3 */
     if (!SDL_Init(SDL_INIT_VIDEO)) {

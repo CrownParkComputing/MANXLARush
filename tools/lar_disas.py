@@ -22,6 +22,7 @@ import struct
 import sys
 from collections import defaultdict
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32
+from capstone.x86 import X86_OP_IMM, X86_OP_MEM
 
 # ── L.A. Rush parameters ──────────────────────────────────────
 
@@ -109,9 +110,12 @@ def load_xbe(path):
     # Derive code regions from section flags (executable bit).  If the
     # image marks nothing executable (some XDK builds don't), fall back
     # to every loaded section so tracing still works.
+    # .data/.data1 are flagged RWX in this build but are data — tracing
+    # pointers into them produces garbage runs.
+    NONCODE = ('.data', '.data1', '.rdata')
     CODE_REGIONS.clear()
     for va, vsize, name, flags in sections:
-        if flags & 0x00000004:
+        if (flags & 0x00000004) and name not in NONCODE:
             CODE_REGIONS.append((va, va + vsize))
     if not CODE_REGIONS:
         print("(no sections flagged executable — treating all as code)")
@@ -180,63 +184,90 @@ def is_unconditional_jmp(mnemonic, op_str):
     return mnemonic == 'jmp'
 
 
+COND_JCC = ('ja','jae','jb','jbe','jc','jcxz','jecxz','je','jg','jge',
+            'jl','jle','jna','jnae','jnb','jnbe','jnc','jne','jng','jnge',
+            'jnl','jnle','jno','jnp','jns','jnz','jo','jp','jpe','jpo',
+            'js','jz','loop','loope','loopne')
+
+
 def disassemble_function(memory, start_va, max_insns=2000):
-    """Returns (insns, callees, terminal_type)."""
+    """Recursive-descent within one function: follows BOTH arms of every
+    conditional branch (worklist), so calls behind a jcc are not lost the
+    way a linear first-ret scan loses them.
+
+    Returns (insns, callees, terminal_type, fptrs) where fptrs are code
+    pointers pushed as immediates (callbacks / thread start routines)."""
     md = Cs(CS_ARCH_X86, CS_MODE_32)
     md.detail = True
 
     insns = []
     callees = []
-    va = start_va
-    visited_branches = set()
+    fptrs = []
+    seen_va = set()
+    worklist = [start_va]
+    term = 'ret'
 
-    for _ in range(max_insns):
-        code = read_bytes(memory, va, 15)
-        if len(code) == 0:
-            return insns, callees, 'fallthrough'
+    while worklist and len(insns) < max_insns:
+        va = worklist.pop()
+        while len(insns) < max_insns:
+            if va in seen_va:
+                break
+            code = read_bytes(memory, va, 15)
+            if len(code) == 0:
+                term = 'fallthrough'
+                break
+            try:
+                decoded = next(md.disasm(code, va))
+            except StopIteration:
+                term = 'unknown'
+                break
 
-        try:
-            decoded = next(md.disasm(code, va))
-        except StopIteration:
-            return insns, callees, 'unknown'
+            mnemonic = decoded.mnemonic
+            op_str = decoded.op_str
+            size = decoded.size
+            seen_va.add(va)
+            insns.append((va, mnemonic, op_str, size))
 
-        mnemonic = decoded.mnemonic
-        op_str = decoded.op_str
-        size = decoded.size
-        insns.append((va, mnemonic, op_str, size))
+            target = None
+            if decoded.operands:
+                op0 = decoded.operands[0]
+                if op0.type == X86_OP_IMM:
+                    target = op0.imm
+                elif op0.type == X86_OP_MEM:
+                    if op0.mem.base == 0 and op0.mem.index == 0:
+                        target = op0.mem.disp
 
-        target = None
-        if decoded.operands:
-            op0 = decoded.operands[0]
-            if op0.type == 1:  # IMM
-                target = op0.imm
-            elif op0.type == 2:  # MEM
-                if op0.mem.base == 0 and op0.mem.index == 0:
-                    target = op0.mem.disp
+            if mnemonic == 'push' and target is not None and \
+                    is_in_code(target):
+                fptrs.append(target)
 
-        if target is not None:
-            if is_kernel_thunk(target):
-                callees.append(target)
-            elif is_call_insn(mnemonic) or is_unconditional_jmp(mnemonic, op_str):
-                if target not in visited_branches and is_in_code(target):
+            if target is not None:
+                if is_kernel_thunk(target):
                     callees.append(target)
+                elif is_call_insn(mnemonic):
+                    if is_in_code(target):
+                        callees.append(target)
 
-        if is_ret_insn(mnemonic):
-            return insns, callees, 'ret'
-        if is_kernel_thunk(va):
-            return insns, callees, 'thunk'
-        if is_unconditional_jmp(mnemonic, op_str) and target:
-            if not is_in_code(target):
-                return insns, callees, 'jmp_outside'
-            visited_branches.add(target)
-            va = target
-            continue
-        if mnemonic == 'hlt' or mnemonic == 'int3':
-            return insns, callees, mnemonic
+            if is_ret_insn(mnemonic) or mnemonic in ('hlt', 'int3'):
+                break
+            if mnemonic in COND_JCC and target is not None:
+                if target not in seen_va and is_in_code(target):
+                    worklist.append(target)
+                va += size
+                continue
+            if is_unconditional_jmp(mnemonic, op_str):
+                if target is None or not is_in_code(target):
+                    break
+                # Tail-jump far away = tail call; nearby = intra-function.
+                if abs(target - start_va) > 0x2000:
+                    callees.append(target)
+                    break
+                va = target
+                continue
+            va += size
 
-        va += size
-
-    return insns, callees, 'max_insns'
+    insns.sort(key=lambda t: t[0])
+    return insns, callees, term, fptrs
 
 
 def trace_call_graph(memory, entry_va, max_depth=8, max_functions=200):
@@ -252,7 +283,7 @@ def trace_call_graph(memory, entry_va, max_depth=8, max_functions=200):
             continue
         visited.add(va)
 
-        insns, callees, term = disassemble_function(memory, va)
+        insns, callees, term, fptrs = disassemble_function(memory, va)
         if not insns:
             continue
 
@@ -284,6 +315,7 @@ def trace_call_graph(memory, entry_va, max_depth=8, max_functions=200):
             'callees': [c for c in callees if not is_kernel_thunk(c)],
             'kernel_calls': kernel_calls,
             'kernel_ordinals': kernel_ordinals,
+            'fptrs': fptrs,
             'depth': depth,
         }
 
@@ -291,6 +323,11 @@ def trace_call_graph(memory, entry_va, max_depth=8, max_functions=200):
             for callee in functions[va]['callees']:
                 if callee not in visited:
                     queue.append((callee, depth + 1, f"sub_0x{callee:08X}"))
+            # Code pointers pushed as immediates are callbacks / thread
+            # start routines — trace them as roots too.
+            for fp in fptrs:
+                if fp not in visited:
+                    queue.append((fp, depth + 1, f"fptr_0x{fp:08X}"))
 
     return functions
 
@@ -356,7 +393,7 @@ def main():
             print(f"  0x{xbe_entry + i:08X}: {hexstr}")
 
     # ── Hypothesis 1: the entry is direct code (unlike FlatOut). ──
-    insns, callees, term = disassemble_function(memory, xbe_entry, max_insns=5000)
+    insns, callees, term, _ = disassemble_function(memory, xbe_entry, max_insns=5000)
     kernel_count = sum(1 for c in callees if is_kernel_thunk(c))
     sub_count = sum(1 for c in callees if not is_kernel_thunk(c))
     direct_score = (len(insns) + kernel_count * 20 + sub_count * 10) if insns else 0
@@ -393,7 +430,7 @@ def main():
     all_functions = {}
 
     for code_va in candidates:
-        insns, callees, term = disassemble_function(memory, code_va, max_insns=5000)
+        insns, callees, term, _ = disassemble_function(memory, code_va, max_insns=5000)
         if not insns or len(insns) < 5:
             continue
         kernel_count = sum(1 for c in callees if is_kernel_thunk(c))
