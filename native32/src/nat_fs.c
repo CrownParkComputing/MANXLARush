@@ -9,25 +9,20 @@
 #include <sys/syscall.h>
 #include <asm/ldt.h>
 
-/* Xbox KPCR offsets touched by game code (NT_TIB + KPCR head). */
-#define KPCR_EXCEPTIONLIST 0x00
-#define KPCR_STACKBASE     0x04
-#define KPCR_STACKLIMIT    0x08
-#define KPCR_SELF          0x18
-#define KPCR_SELFPCR       0x1C
-#define KPCR_PRCB          0x20
-#define KPCR_IRQL          0x24
-#define KPCR_PRCBDATA      0x28   /* KPRCB; +0x00 = CurrentThread */
-
-uint16_t nat_fs_install(uint32_t kpcr_va) {
-    /* Prefill the self-referential fields.  (Per-thread StackBase/Limit
-     * and CurrentThread are filled by the thread setup in C1.e.) */
+void nat_fs_init_kpcr(uint32_t kpcr_va, uint32_t stack_base,
+                      uint32_t stack_limit, uint32_t current_thread_va) {
     GMEM32(kpcr_va + KPCR_EXCEPTIONLIST) = 0xFFFFFFFFu;
+    GMEM32(kpcr_va + KPCR_STACKBASE)  = stack_base;
+    GMEM32(kpcr_va + KPCR_STACKLIMIT) = stack_limit;
     GMEM32(kpcr_va + KPCR_SELF)    = kpcr_va;
     GMEM32(kpcr_va + KPCR_SELFPCR) = kpcr_va;
     GMEM32(kpcr_va + KPCR_PRCB)    = kpcr_va + KPCR_PRCBDATA;
     GMEM32(kpcr_va + KPCR_IRQL)    = 0;
+    /* KPRCB.CurrentThread (fs:[0x28]) */
+    GMEM32(kpcr_va + KPCR_PRCBDATA + 0x00) = current_thread_va;
+}
 
+uint16_t nat_fs_load(uint32_t kpcr_va) {
     struct user_desc d;
     memset(&d, 0, sizeof d);
     d.entry_number    = -1;            /* kernel picks a free GDT slot */
@@ -54,6 +49,11 @@ uint16_t nat_fs_install(uint32_t kpcr_va) {
         return 0;
     }
     return sel;
+}
+
+uint16_t nat_fs_install(uint32_t kpcr_va) {
+    nat_fs_init_kpcr(kpcr_va, 0, 0, 0);
+    return nat_fs_load(kpcr_va);
 }
 
 uint32_t nat_fs_read32(uint32_t disp) {

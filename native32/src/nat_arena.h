@@ -21,6 +21,16 @@
  * window already occupied — reserve it before anything else maps). */
 int nat_arena_reserve(void);
 
+/* Map a fake Xbox kernel window at 0x80000000 (the kernel is at
+ * 0x80010000 on real hardware).  The CRT's kernel-build probe reads the
+ * kernel PE header via [0x8001003C]-0x7FFF0000 and checks whether the
+ * last section is named "INIT"; we point it at a benign fake header so
+ * the probe finds no INIT section and skips the kernel patch. */
+int nat_kernel_region(void);
+
+#define NAT_KERNEL_BASE 0x80000000u
+#define NAT_KERNEL_SIZE 0x00100000u   /* 1 MB window */
+
 /* Loaded XBE description. */
 typedef struct {
     uint32_t base;          /* image base (== NAT_ARENA_BASE)        */

@@ -13,6 +13,7 @@
 
 #include "nat_stubs.h"
 #include "nat_arena.h"
+#include "nat_thread.h"
 #include "larush_k9_vfs.h"
 #include "xkernel_ordinals.h"
 
@@ -205,20 +206,82 @@ XSTDCALL static uint32_t nk_NtClose(uint32_t handle) {
     return STATUS_SUCCESS;
 }
 
+/* ── Virtual memory (page-bump allocator) ──────────────────── */
+#define VM_BASE 0x02000000u
+#define VM_END  0x03A00000u
+static uint32_t s_vm_next = VM_BASE;
+
+XSTDCALL static uint32_t nk_NtAllocateVirtualMemory(uint32_t base_va,
+        uint32_t zbits, uint32_t size_va, uint32_t type, uint32_t protect) {
+    (void)zbits; (void)type; (void)protect;
+    if (!size_va) return 0xC000000Du;
+    uint32_t size = GMEM32(size_va);
+    uint32_t want = base_va ? GMEM32(base_va) : 0;
+    uint32_t got;
+    if (want) {
+        got = want & ~0xFFFu;                 /* honor requested base */
+    } else {
+        got = (s_vm_next + 0xFFFu) & ~0xFFFu;
+        s_vm_next = got + ((size + 0xFFFu) & ~0xFFFu);
+        if (s_vm_next > VM_END) return 0xC000009Au;
+    }
+    if (base_va) GMEM32(base_va) = got;
+    if (size_va) GMEM32(size_va) = (size + 0xFFFu) & ~0xFFFu;
+    return STATUS_SUCCESS;
+}
+XSTDCALL static uint32_t nk_NtFreeVirtualMemory(uint32_t base_va,
+        uint32_t size_va, uint32_t type) {
+    (void)base_va; (void)size_va; (void)type;
+    return STATUS_SUCCESS;
+}
+
+/* ── Debug print ───────────────────────────────────────────── */
+/* cdecl varargs: caller cleans up, so a plain cdecl function is safe. */
+static uint32_t nk_DbgPrint(uint32_t fmt_va, ...) {
+    if (fmt_va && fmt_va < NAT_ARENA_END)
+        fprintf(stderr, "  [DbgPrint] %.200s", (const char *)(uintptr_t)fmt_va);
+    return 0;
+}
+
 /* ── Generic arity-correct abort stubs ─────────────────────── */
 /* One per stdcall arg-count 0..10 so `ret n` balances the guest stack
  * even for ordinals we haven't implemented yet.  Reports the ordinal and
  * the guest call site, then exits (C1 policy: loud on first hit). */
+/* Slot VA -> ordinal, recorded at patch time so a miss can name itself. */
+#define THUNK_SLOTS 144
+static uint32_t s_slot_va[THUNK_SLOTS];
+static uint32_t s_slot_ord[THUNK_SLOTS];
+static int s_slot_count = 0;
+
+static uint32_t ordinal_at_callsite(uint32_t retaddr) {
+    /* The guest call is `FF 15 <abs32>` (call dword ptr [slot]); the
+     * return address points just past it, so the slot VA is at -4. */
+    if (retaddr < NAT_ARENA_BASE + 6 || retaddr >= NAT_ARENA_END) return 0;
+    const uint8_t *p = (const uint8_t *)(uintptr_t)(retaddr - 6);
+    if (p[0] != 0xFF || p[1] != 0x15) return 0;
+    uint32_t slot; memcpy(&slot, p + 2, 4);
+    for (int i = 0; i < s_slot_count; i++)
+        if (s_slot_va[i] == slot) return s_slot_ord[i];
+    return 0;
+}
+
+/* Default policy for unimplemented ordinals: log the first hit of each,
+ * then return 0 (STATUS_SUCCESS / NULL).  This walks the whole boot
+ * kernel-call sequence in one run; a bogus 0 that gets used as a pointer
+ * faults later and the signal dumper names the site.  Ordinals that
+ * clearly need real return values get real stubs above. */
+static uint8_t s_logged[512];
+static int s_miss_total = 0;
+
 static void stub_miss(int nargs, void *retaddr) {
-    /* The abort stubs share one slot value each; recover the ordinal by
-     * scanning which slot the guest called.  We don't have it here, so
-     * report args + caller and exit. */
-    fprintf(stderr,
-        "\n*** UNIMPLEMENTED kernel call (%d args) from guest 0x%08X ***\n"
-        "    (add a real stub in nat_stubs.c — C1.e)\n",
-        nargs, (uint32_t)(uintptr_t)retaddr);
-    fflush(stderr);
-    _exit(42);
+    uint32_t ra = (uint32_t)(uintptr_t)retaddr;
+    uint32_t ord = ordinal_at_callsite(ra);
+    if (ord < 512 && !s_logged[ord]) {
+        s_logged[ord] = 1;
+        s_miss_total++;
+        fprintf(stderr, "  [stub] %s (ord %u, %d args) -> 0  [from 0x%08X]\n",
+                ord ? nat_ordinal_name(ord) : "?", ord, nargs, ra);
+    }
 }
 #define ABORT_STUB(N, ...) \
     XSTDCALL static uint32_t nk_abort_##N(__VA_ARGS__) { \
@@ -261,17 +324,28 @@ static void *impl_stub_for(uint32_t ord) {
     case 277: case 294: return (void *)nk_CS_noop;
     case 289: return (void *)nk_RtlInitAnsiString;
     case 291: return (void *)nk_RtlInitCS;
+    case 184: return (void *)nk_NtAllocateVirtualMemory;
+    case 199: return (void *)nk_NtFreeVirtualMemory;
+    case 8:   return (void *)nk_DbgPrint;
+    case 255: return (void *)nk_PsCreateSystemThreadEx;
+    case 258: return (void *)nk_PsTerminateSystemThread;
     default:  return NULL;
     }
 }
 
 uint32_t nat_thunks_patch(const nat_xbe *xbe) {
     uint32_t n = 0;
+    s_slot_count = 0;
     for (uint32_t i = 0; i < 144; i++) {
         uint32_t slot = xbe->thunk_va + i * 4u;
         uint32_t val = GMEM32(slot);
         if (!(val & 0x80000000u)) continue;   /* not an ordinal entry */
         uint32_t ord = val & 0x7FFFFFFFu;
+        if (s_slot_count < THUNK_SLOTS) {
+            s_slot_va[s_slot_count]  = slot;
+            s_slot_ord[s_slot_count] = ord;
+            s_slot_count++;
+        }
 
         if (ord <= XK_ORDINAL_MAX && s_kind[ord] == XK_DATA) {
             GMEM32(slot) = kdata_va(ord);      /* data export cell */

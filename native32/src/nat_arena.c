@@ -27,6 +27,28 @@ int nat_arena_reserve(void) {
     return 0;
 }
 
+int nat_kernel_region(void) {
+    void *want = (void *)(uintptr_t)NAT_KERNEL_BASE;
+    void *got = mmap(want, NAT_KERNEL_SIZE, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (got != want) {
+        fprintf(stderr, "nat_kernel_region: map at 0x80000000 failed (errno=%d)\n",
+                errno);
+        return -1;
+    }
+    /* Fake kernel PE header at guest VA 0x00F30000 (readable arena).
+     * The probe computes hdr = [0x8001003C] - 0x7FFF0000, then treats
+     * hdr as a PE header: NumberOfSections @ +6, SizeOfOptionalHeader
+     * @ +0x14, last section name @ hdr + optsz + 40*nsec - 0x10. */
+    uint32_t hdr = 0x00F30000u;
+    GMEM16(hdr + 0x06) = 1;        /* NumberOfSections = 1        */
+    GMEM16(hdr + 0x14) = 0;        /* SizeOfOptionalHeader = 0    */
+    GMEM32(hdr + (0 + 5 * 1 * 8) - 0x10) = 0;   /* last-section name != 'INIT' */
+    /* [0x8001003C] = hdr + 0x7FFF0000 so the subtraction lands on hdr. */
+    GMEM32(0x8001003Cu) = hdr + 0x7FFF0000u;
+    return 0;
+}
+
 /* ── XBE header field offsets (from the image base) ──────────── */
 #define XBE_OFF_BASE        0x104   /* image base                     */
 #define XBE_OFF_SIZEOFHDRS  0x108   /* SizeOfHeaders                  */

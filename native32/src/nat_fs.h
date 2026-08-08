@@ -13,9 +13,28 @@
 
 #include <stdint.h>
 
-/* Point %fs at a KPCR located at guest VA `kpcr_va`, writing the
- * self-pointer fields so fs:[0x18]/fs:[0x1C] read back as kpcr_va.
- * Returns the GDT selector loaded into %fs, or 0 on failure. */
+/* Xbox KPCR field offsets (NT_TIB + KPCR head + embedded KPRCB). */
+#define KPCR_EXCEPTIONLIST 0x00
+#define KPCR_STACKBASE     0x04
+#define KPCR_STACKLIMIT    0x08
+#define KPCR_SELF          0x18
+#define KPCR_SELFPCR       0x1C
+#define KPCR_PRCB          0x20
+#define KPCR_IRQL          0x24
+#define KPCR_PRCBDATA      0x28   /* KPRCB; +0x00 = CurrentThread */
+#define KPCR_SIZE          0x300
+
+/* Initialize a KPCR at `kpcr_va` (self-pointers, exception list, stack
+ * bounds, current-thread).  Does NOT load %fs. */
+void nat_fs_init_kpcr(uint32_t kpcr_va, uint32_t stack_base,
+                      uint32_t stack_limit, uint32_t current_thread_va);
+
+/* Point %fs at the KPCR at `kpcr_va` for the calling thread.  Returns
+ * the GDT selector, or 0 on failure. */
+uint16_t nat_fs_load(uint32_t kpcr_va);
+
+/* Init a KPCR and load %fs in one step (self-pointers only).  Returns
+ * the selector, or 0 on failure. */
 uint16_t nat_fs_install(uint32_t kpcr_va);
 
 /* Read a dword through the current %fs (fs:[disp]). */

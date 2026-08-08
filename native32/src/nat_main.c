@@ -10,6 +10,8 @@
 #include "nat_arena.h"
 #include "nat_fs.h"
 #include "nat_stubs.h"
+#include "nat_thread.h"
+#include "nat_signals.h"
 #include "larush_k9_vfs.h"
 
 #include <stdio.h>
@@ -152,6 +154,35 @@ static int thunks_mode(const char *data_dir) {
     return s_fail;
 }
 
+/* --run <data_dir>: load, patch, install fault handlers, and jump to the
+ * real entry point.  The game's CRT + static constructors then execute
+ * natively.  (First-run diagnostic: reports how far boot gets and which
+ * kernel call, if any, is still unimplemented.) */
+static int run_mode(const char *data_dir) {
+    fprintf(stderr, "LARushNative --run %s (Stage C1.e)\n", data_dir);
+    if (nat_arena_reserve() != 0) return 1;
+    if (nat_kernel_region() != 0) return 1;
+    nat_xbe xbe;
+    if (nat_load_xbe(data_dir, &xbe) != 0) return 1;
+
+    /* Open the frontend archive so file I/O has something to serve. */
+    char apath[1024];
+    snprintf(apath, sizeof apath,
+             "%s/COMPRESSED_Frontend/frontend.dir.k9z", data_dir);
+    larush_k9 *k9 = larush_k9_open(apath);
+    nat_stubs_set_k9(k9);
+
+    uint32_t patched = nat_thunks_patch(&xbe);
+    fprintf(stderr, "patched %u thunk slots; installing fault handlers\n",
+            patched);
+    nat_signals_install();
+
+    int status = nat_thread_boot(xbe.entry);
+    fprintf(stderr, "\n=== guest boot returned, status 0x%08X ===\n", status);
+    if (k9) larush_k9_close(k9);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "--self-test") == 0)
         return self_test();
@@ -159,6 +190,8 @@ int main(int argc, char **argv) {
         return load_mode(argv[2]);
     if (argc > 2 && strcmp(argv[1], "--thunks") == 0)
         return thunks_mode(argv[2]);
+    if (argc > 2 && strcmp(argv[1], "--run") == 0)
+        return run_mode(argv[2]);
 
     fprintf(stderr,
         "LARushNative: native-execution harness (Stage C1.d)\n"

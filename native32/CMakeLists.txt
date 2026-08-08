@@ -22,6 +22,8 @@ add_executable(LARushNative
     src/nat_arena.c
     src/nat_fs.c
     src/nat_stubs.c
+    src/nat_thread.c
+    src/nat_signals.c
     ${SHARED_SRC})
 target_include_directories(LARushNative PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../src
