@@ -21,6 +21,23 @@
  * window already occupied — reserve it before anything else maps). */
 int nat_arena_reserve(void);
 
+/* Loaded XBE description. */
+typedef struct {
+    uint32_t base;          /* image base (== NAT_ARENA_BASE)        */
+    uint32_t entry;         /* decoded entry VA (0x001B2594 retail)  */
+    uint32_t size_of_image; /* image span from base                  */
+    uint32_t thunk_va;      /* kernel thunk table VA (0x002A1620)    */
+    uint32_t xor_key;       /* the entry/thunk XOR key that resolved */
+    uint32_t nsections;
+} nat_xbe;
+
+/* Load default.xbe from `data_dir` into the (already reserved) arena at
+ * true VAs: copies the header page to `base`, then each section's raw
+ * bytes to its VA, zero-filling vsize>rsize tails.  Decodes the entry
+ * point and kernel-thunk VA from the header.  Returns 0 on success and
+ * fills *out; -1 on any error. */
+int nat_load_xbe(const char *data_dir, nat_xbe *out);
+
 /* Direct guest-memory accessors (offset is 0 — VA is the host address). */
 #define GMEM8(va)  (*(volatile uint8_t  *)(uintptr_t)(va))
 #define GMEM16(va) (*(volatile uint16_t *)(uintptr_t)(va))

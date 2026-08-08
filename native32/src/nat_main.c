@@ -67,13 +67,48 @@ static int self_test(void) {
     return s_fail;
 }
 
+/* --load <data_dir>: reserve the arena, load the XBE at true VAs, and
+ * verify the entry point disassembles to the known retail signature.
+ * The section copy is confirmed by reading guest memory directly. */
+static int load_mode(const char *data_dir) {
+    printf("LARushNative --load %s (Stage C1.c)\n", data_dir);
+    if (nat_arena_reserve() != 0) return 1;
+
+    nat_xbe xbe;
+    if (nat_load_xbe(data_dir, &xbe) != 0) return 1;
+
+    s_fail = 0;
+    CHECK(xbe.entry == 0x001B2594u, "entry == 0x001B2594");
+    CHECK(xbe.thunk_va == 0x002A1620u, "thunk table == 0x002A1620");
+    CHECK(xbe.xor_key == 0xA8FC57ABu, "retail XOR key");
+
+    /* Header page landed: the entry reads [0x10108]/[0x10118]. */
+    CHECK(GMEM32(0x00010104u) == 0x00010000u, "header page: base field");
+
+    /* Entry bytes: `mov ecx,[0x10118]; mov eax,[0x10108]` =
+     * 8B 0D 18 01 01 00  A1 08 01 01 00 */
+    CHECK(GMEM8(0x001B2594u) == 0x8B && GMEM8(0x001B2595u) == 0x0D &&
+          GMEM8(0x001B259Au) == 0xA1,
+          "entry code bytes match retail disassembly");
+
+    /* Thunk table: 144 entries of (0x80000000 | ordinal). */
+    uint32_t e0 = GMEM32(0x002A1620u);
+    CHECK((e0 & 0x80000000u) != 0, "thunk[0] high bit set (ordinal entry)");
+
+    printf(s_fail ? "\nLOAD FAILED\n" : "\nLoad verified.\n");
+    return s_fail;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "--self-test") == 0)
         return self_test();
+    if (argc > 2 && strcmp(argv[1], "--load") == 0)
+        return load_mode(argv[2]);
 
     fprintf(stderr,
-        "LARushNative: native-execution harness (Stage C1.a scaffold)\n"
-        "  --self-test   verify arena + %%fs + k9 codec\n"
-        "Guest execution (loader, thunks, threads) arrives in C1.c-f.\n");
+        "LARushNative: native-execution harness (Stage C1.c)\n"
+        "  --self-test        verify arena + %%fs + k9 codec\n"
+        "  --load <data_dir>  load the XBE at true VAs and verify\n"
+        "Thunk patch, threads and probes arrive in C1.d-f.\n");
     return 2;
 }
