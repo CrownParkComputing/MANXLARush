@@ -123,6 +123,15 @@ XBE header fields:
       byte-wise writes.  NOTE: `MANXFlatOut1/tools/flatout1_boot.c`
       uses `SDL_PIXELFORMAT_RGBA8888` with the same decoder — the same
       bug, worth fixing there
+- [x] **k9 car mesh format cracked** (`COMPRESSED_Cars/cars.dir.k9z`,
+      107 car entries): descriptor blocks mix 20-byte D3DTexture
+      records with 12-byte `{0x00800001, offset, 0}` buffer records;
+      vertex buffers are **stride 20, int16 x,y,z position (~mm) at
+      offset 0** plus packed normal/uv/colour dwords.  The game-loop
+      viewer's attract cycle alternates a garage state — the selected
+      car (`--car NN`) rotating as a perspective point cloud — with
+      frontend art.  Wheels sit at the model origin awaiting runtime
+      placement matrices; index-buffer decode (topology) still open
 - [ ] Port main's callees off the hit-list — likely order: engine init
       `0x0017C930` (676 insns, gates most globals), then the per-frame
       eleven (state step `0x00087BC0`, world `0x000F3F20`, render
