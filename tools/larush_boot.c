@@ -23,6 +23,7 @@ extern void larush_kernel_set_k9(larush_k9 *k9);
 #include <string.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <unistd.h>
 
 /* ── k9 texture package parsing ──────────────────────────────
  *
@@ -144,9 +145,41 @@ static uint32_t *make_placeholder(int w, int h) {
     return px;
 }
 
+/* Find the retail data dir: argv[1] wins; otherwise walk up from the
+ * cwd and from the executable's directory so the tool works no matter
+ * where it is launched from (repo root, build/, a shortcut, …). */
+static const char *find_data_dir(int argc, char **argv, char *buf, size_t cap) {
+    if (argc > 1) return argv[1];
+
+    static const char *SUFFIX = "game_data/L.A.Rush.USA.XBOX-ZTM";
+    char roots[2][1024] = {{0}};
+    if (!getcwd(roots[0], sizeof(roots[0]))) roots[0][0] = '\0';
+    ssize_t n = readlink("/proc/self/exe", roots[1], sizeof(roots[1]) - 1);
+    if (n > 0) {
+        roots[1][n] = '\0';
+        char *slash = strrchr(roots[1], '/');
+        if (slash) *slash = '\0';
+    }
+
+    for (int r = 0; r < 2; r++) {
+        char *root = roots[r];
+        if (!root[0]) continue;
+        for (int up = 0; up < 6; up++) {
+            struct stat st;
+            snprintf(buf, cap, "%s/%s", root, SUFFIX);
+            if (stat(buf, &st) == 0 && S_ISDIR(st.st_mode)) return buf;
+            char *slash = strrchr(root, '/');
+            if (!slash || slash == root) break;
+            *slash = '\0';
+        }
+    }
+    return SUFFIX; /* last resort: the old cwd-relative default */
+}
+
 int main(int argc, char **argv) {
-    const char *data_dir = argc > 1 ? argv[1]
-        : "game_data/L.A.Rush.USA.XBOX-ZTM";
+    char data_dir_buf[2048];
+    const char *data_dir =
+        find_data_dir(argc, argv, data_dir_buf, sizeof(data_dir_buf));
 
     k9_texture tex_info = {0};
     const char *loaded = NULL;
@@ -163,7 +196,7 @@ int main(int argc, char **argv) {
         NULL
     };
     for (int p = 0; PACKS[p] && !loaded; p++) {
-        char pack_path[1024];
+        char pack_path[2304];
         snprintf(pack_path, sizeof(pack_path), "%s/%s", data_dir, PACKS[p]);
         struct stat st;
         if (stat(pack_path, &st) != 0) continue;
@@ -203,6 +236,18 @@ int main(int argc, char **argv) {
         if (!loaded) { larush_k9_close(k9); k9 = NULL; }
     }
     (void)tex_info;
+
+    /* No archive decoded → fall back to the procedural placeholder so
+     * the window always shows *something*, and say why on stderr. */
+    if (!loaded) {
+        fprintf(stderr,
+                "warning: no k9 texture package found under \"%s\"\n"
+                "         (pass the data dir as argv[1]) — showing the "
+                "procedural placeholder instead\n", data_dir);
+        tex_w = 640; tex_h = 480;
+        decoded_pixels = make_placeholder(tex_w, tex_h);
+        loaded = "procedural placeholder (no game data found)";
+    }
 
     /* Init SDL3 */
     if (!SDL_Init(SDL_INIT_VIDEO)) {
