@@ -131,7 +131,15 @@ XBE header fields:
       viewer's attract cycle alternates a garage state — the selected
       car (`--car NN`) rotating as a perspective point cloud — with
       frontend art.  Wheels sit at the model origin awaiting runtime
-      placement matrices; index-buffer decode (topology) still open
+      placement matrices.  The garage renders **flat-shaded z-buffered
+      triangles** from the strip-ordered vertices (over-long edges
+      dropped as strip restarts) with vertex splats filling holes
+- [ ] Exact car topology: mesh records in the info block are ~240 B
+      (name, material, mesh id, index counts like 0xDDA); a u16 region
+      at `info+0x30CC..0xC7F4` (~19K values, max = vtx_count−1) holds
+      the index data, but neither plain strip nor plain list decode
+      cleanly, and part of it is an ascending-first edge/adjacency
+      table — needs a proper record-layout reverse
 - [ ] Port main's callees off the hit-list — likely order: engine init
       `0x0017C930` (676 insns, gates most globals), then the per-frame
       eleven (state step `0x00087BC0`, world `0x000F3F20`, render

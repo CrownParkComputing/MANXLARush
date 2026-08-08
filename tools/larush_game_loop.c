@@ -70,6 +70,11 @@ typedef struct { float x, y, z; } car_vtx;
 static car_vtx *s_car = NULL;
 static uint32_t s_car_count = 0;
 static char s_car_name[24] = "";
+/* Strip boundaries: each buffer is one non-indexed triangle strip
+ * (verified: median consecutive-vertex distance ~77 mm on a 2.9 m
+ * model).  s_strip[i]..s_strip[i+1] indexes into s_car. */
+static uint32_t s_strip[300];
+static int s_strip_count = 0;
 
 static void load_car(larush_k9 *k9, const char *want) {
     uint32_t idx = (uint32_t)-1;
@@ -116,9 +121,9 @@ static void load_car(larush_k9 *k9, const char *want) {
     car_vtx *vts = malloc(sizeof(car_vtx) * (size[2] / 20 + 1));
     if (!vts) return;
     uint32_t n = 0;
-    for (int b = 0; b < nstarts; b++) {
+    for (int b = 0; b < nstarts && s_strip_count < 299; b++) {
         uint32_t bo = starts[b], bs = starts[b+1] - starts[b];
-        if (bs % 20 || bs < 400) continue;
+        if (bs % 20 || bs < 60) continue;
         uint32_t bn = bs / 20, inlier = 0;
         for (uint32_t i = 0; i < bn; i++) {
             int16_t v[3];
@@ -128,6 +133,7 @@ static void load_car(larush_k9 *k9, const char *want) {
                 inlier++;
         }
         if (inlier * 100 < bn * 98) continue;
+        s_strip[s_strip_count++] = n;
         for (uint32_t i = 0; i < bn; i++) {
             int16_t v[3];
             memcpy(v, payload + bo + i * 20, 6);
@@ -137,6 +143,7 @@ static void load_car(larush_k9 *k9, const char *want) {
             n++;
         }
     }
+    s_strip[s_strip_count] = n;
     s_car = vts;
     s_car_count = n;
     snprintf(s_car_name, sizeof(s_car_name), "car %s", want);
@@ -155,36 +162,115 @@ static uint32_t s_fb[FB_W * FB_H];
     (((uint32_t)(a) << 24) | ((uint32_t)(b) << 16) | \
      ((uint32_t)(g) <<  8) | (uint32_t)(r))
 
-/* Rotating point-cloud render of the car mesh. */
+/* Rotating flat-shaded render of the car mesh: each buffer is one
+ * non-indexed triangle strip; strip-restart artifacts show up as
+ * triangles with an over-long model-space edge and are skipped. */
+
+static float s_zbuf[FB_W * FB_H];
+static float s_vx[16384], s_vy[16384], s_vz[16384];   /* view space */
+
+static void fill_tri(int i0, int i1, int i2, uint32_t color) {
+    float x0 = s_vx[i0], y0 = s_vy[i0], z0 = s_vz[i0];
+    float x1 = s_vx[i1], y1 = s_vy[i1], z1 = s_vz[i1];
+    float x2 = s_vx[i2], y2 = s_vy[i2], z2 = s_vz[i2];
+    int minx = (int)fminf(fminf(x0, x1), x2), maxx = (int)fmaxf(fmaxf(x0, x1), x2);
+    int miny = (int)fminf(fminf(y0, y1), y2), maxy = (int)fmaxf(fmaxf(y0, y1), y2);
+    if (minx < 0) minx = 0;
+    if (miny < 0) miny = 0;
+    if (maxx >= FB_W) maxx = FB_W - 1;
+    if (maxy >= FB_H) maxy = FB_H - 1;
+    float area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+    if (area == 0.0f) return;
+    float inv = 1.0f / area;
+    for (int y = miny; y <= maxy; y++)
+        for (int x = minx; x <= maxx; x++) {
+            float w0 = ((x1 - (float)x) * (y2 - (float)y) -
+                        (x2 - (float)x) * (y1 - (float)y)) * inv;
+            float w1 = ((x2 - (float)x) * (y0 - (float)y) -
+                        (x0 - (float)x) * (y2 - (float)y)) * inv;
+            float w2 = 1.0f - w0 - w1;
+            if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+            float z = w0 * z0 + w1 * z1 + w2 * z2;
+            int o = y * FB_W + x;
+            if (z < s_zbuf[o]) { s_zbuf[o] = z; s_fb[o] = color; }
+        }
+}
+
 static void draw_car(uint32_t frame) {
+    if (s_car_count > 16384) return;
     float ang = (float)frame * 0.025f;
     float ca = cosf(ang), sa = sinf(ang);
+    const float CAMD = 4.2f;
+
+    for (int i = 0; i < FB_W * FB_H; i++) s_zbuf[i] = 1e9f;
+
     for (uint32_t i = 0; i < s_car_count; i++) {
-        float x = s_car[i].x, y = s_car[i].y, z = s_car[i].z;
-        float rx = x * ca - z * sa;
-        float rz = x * sa + z * ca;
-        float cz = rz + 4.2f;                 /* camera distance */
-        if (cz < 0.5f) continue;
-        int px = FB_W / 2 + (int)(rx * 620.0f / cz);
-        int py = FB_H / 2 + 30 - (int)((y + 0.10f) * 620.0f / cz);
-        if (px < 1 || px >= FB_W - 1 || py < 1 || py >= FB_H - 1)
+        float rx = s_car[i].x * ca - s_car[i].z * sa;
+        float rz = s_car[i].x * sa + s_car[i].z * ca;
+        float cz = rz + CAMD;
+        if (cz < 0.5f) cz = 0.5f;
+        s_vx[i] = (float)(FB_W / 2) + rx * 620.0f / cz;
+        s_vy[i] = (float)(FB_H / 2 + 30) - (s_car[i].y + 0.10f) * 620.0f / cz;
+        s_vz[i] = cz;
+    }
+
+    /* Ground plane wash first (under the car). */
+    int gy = FB_H / 2 + 30 + (int)(0.32f * 620.0f / CAMD);
+    for (int y = gy; y < FB_H; y++)
+        for (int x = 0; x < FB_W; x++)
+            s_fb[y * FB_W + x] = ABGR(0x22, 0x14, 0x20, 0xFF);
+
+    /* Two-sided flat shading, light from upper-front-left. */
+    const float lx = -0.45f, ly = 0.78f, lz = -0.43f;
+    for (int st = 0; st < s_strip_count; st++) {
+        for (uint32_t i = s_strip[st]; i + 2 < s_strip[st + 1]; i++) {
+            car_vtx a = s_car[i], b = s_car[i + 1], c = s_car[i + 2];
+            float e1x = b.x - a.x, e1y = b.y - a.y, e1z = b.z - a.z;
+            float e2x = c.x - a.x, e2y = c.y - a.y, e2z = c.z - a.z;
+            /* Skip strip-restart bridges (over-long edges). */
+            const float MAXE = 0.04f;        /* (0.2 m)^2 */
+            float e3x = c.x - b.x, e3y = c.y - b.y, e3z = c.z - b.z;
+            if (e1x * e1x + e1y * e1y + e1z * e1z > MAXE) continue;
+            if (e2x * e2x + e2y * e2y + e2z * e2z > MAXE) continue;
+            if (e3x * e3x + e3y * e3y + e3z * e3z > MAXE) continue;
+            float nx = e1y * e2z - e1z * e2y;
+            float ny = e1z * e2x - e1x * e2z;
+            float nz = e1x * e2y - e1y * e2x;
+            float nl = sqrtf(nx * nx + ny * ny + nz * nz);
+            if (nl < 1e-9f) continue;
+            /* Rotate the normal with the model. */
+            float rnx = nx * ca - nz * sa;
+            float rnz = nx * sa + nz * ca;
+            float lit = (rnx * lx + ny * ly + rnz * lz) / nl;
+            if (lit < 0) lit = -lit;             /* two-sided */
+            float d = 0.25f + 0.75f * lit;
+            fill_tri((int)i, (int)i + 1, (int)i + 2,
+                     ABGR((uint8_t)(235 * d), (uint8_t)(90 * d),
+                          (uint8_t)(45 * d), 0xFF));
+        }
+    }
+
+    /* Vertex splats fill the gaps the heuristic topology leaves
+     * (exact strip tables in the info block are still undecoded). */
+    for (uint32_t i = 0; i < s_car_count; i++) {
+        int px = (int)s_vx[i], py = (int)s_vy[i];
+        float cz = s_vz[i];
+        if (px < 0 || px >= FB_W - 1 || py < 0 || py >= FB_H - 1)
             continue;
-        /* Depth-shaded body colour (near = bright). */
-        float d = (4.2f + 1.6f - cz) / 2.6f;
+        float d = (CAMD + 1.6f - cz) / 2.6f;
         if (d < 0.35f) d = 0.35f;
         if (d > 1.0f) d = 1.0f;
-        uint32_t c = ABGR((uint8_t)(255 * d), (uint8_t)(150 * d),
-                          (uint8_t)(60 * d), 0xFF);
-        s_fb[py * FB_W + px] = c;             /* 2×2 splat */
-        s_fb[py * FB_W + px + 1] = c;
-        s_fb[(py + 1) * FB_W + px] = c;
-        s_fb[(py + 1) * FB_W + px + 1] = c;
+        uint32_t c = ABGR((uint8_t)(220 * d), (uint8_t)(95 * d),
+                          (uint8_t)(50 * d), 0xFF);
+        for (int dy = 0; dy < 2; dy++)
+            for (int dx = 0; dx < 2; dx++) {
+                int o = (py + dy) * FB_W + px + dx;
+                if (cz <= s_zbuf[o] + 0.02f) {
+                    s_zbuf[o] = cz;
+                    s_fb[o] = c;
+                }
+            }
     }
-    /* Ground line */
-    int gy = FB_H / 2 + 30 + (int)(0.32f * 620.0f / 4.2f);
-    if (gy > 0 && gy < FB_H)
-        for (int x = 40; x < FB_W - 40; x++)
-            s_fb[gy * FB_W + x] = ABGR(0x40, 0x28, 0x30, 0xFF);
 }
 
 static void compose_frame(void) {
