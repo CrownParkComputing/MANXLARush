@@ -146,6 +146,13 @@ XBE header fields:
       with degenerate stitching, local to each chunk's buffer** (car
       01: 10,916 clean triangles, zero over-long edges).  The garage
       renders the exact mesh; heuristic strips remain as fallback
+- [x] **Textured garage render.**  Vertex layout complete: stride-20 =
+      int16 pos ×3, int16 normal ×3, **UV ×2 in /2048 fixed point**
+      (slots 6-7), packed dword.  Chunk `part_id` indexes the entry's
+      own texture list (256×256 DXT3 etc.); the software rasterizer
+      does perspective-correct UV sampling modulated by flat lighting.
+      Car 01 shows its real materials: black paint, red flame fender
+      trim, chrome sills, tail-light glass, orange interior
 - [ ] Port main's callees off the hit-list — likely order: engine init
       `0x0017C930` (676 insns, gates most globals), then the per-frame
       eleven (state step `0x00087BC0`, world `0x000F3F20`, render
