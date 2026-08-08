@@ -68,7 +68,12 @@ static int s_show_car = 0;       /* garage state active this frame */
 typedef struct { float x, y, z; } car_vtx;
 
 static car_vtx *s_car = NULL;
+static float   *s_car_uv = NULL;      /* u,v per vertex (slots 6-7 / 2048) */
 static uint32_t s_car_count = 0;
+
+/* Car textures, decoded from the same k9 entry. */
+static struct { uint32_t *rgba; int w, h; } s_ctex[16];
+static int s_ctex_count = 0;
 static char s_car_name[24] = "";
 /* Strip boundaries: each buffer is one non-indexed triangle strip
  * (verified: median consecutive-vertex distance ~77 mm on a 2.9 m
@@ -77,8 +82,10 @@ static uint32_t s_strip[300];
 static int s_strip_count = 0;
 
 /* Exact topology (when the info-block chunk table decodes):
- * triangles as global-index triples into s_car. */
+ * triangles as global-index triples into s_car, with a per-triangle
+ * texture id (the chunk's part_id). */
 static uint32_t *s_tris = NULL;
+static uint8_t  *s_tri_tex = NULL;
 static uint32_t s_tri_count = 0;
 
 static void load_car(larush_k9 *k9, const char *want) {
@@ -114,6 +121,32 @@ static void load_car(larush_k9 *k9, const char *want) {
             dorder[nvb++] = data;
             p += 12;
         } else if ((common & 0x00070000u) == 0x00040000u) {
+            /* Texture descriptor: decode it for the textured render. */
+            if (s_ctex_count < 16 && p + 20 <= size[1]) {
+                uint32_t format;
+                memcpy(&format, desc + p + 12, 4);
+                uint32_t fmt = (format >> 8) & 0xFFu;
+                uint32_t w = 1u << ((format >> 20) & 0xFu);
+                uint32_t h = 1u << ((format >> 24) & 0xFu);
+                uint32_t fcc = fmt == 0x0Cu ? FOURCC_DXT1 :
+                               fmt == 0x0Eu ? FOURCC_DXT3 :
+                               fmt == 0x0Fu ? FOURCC_DXT5 : 0;
+                size_t need = ((w + 3) / 4) * ((h + 3) / 4) *
+                              (fmt == 0x0Cu ? 8 : 16);
+                if (fcc && w >= 8 && h >= 8 && w <= 1024 && h <= 1024 &&
+                    data + need <= size[2]) {
+                    uint32_t *rgba = malloc(dxt_decode_dst_size(w, h));
+                    if (rgba && dxt_decode_image(payload + data,
+                            (uint32_t)need, rgba, w, h, fcc)) {
+                        s_ctex[s_ctex_count].rgba = rgba;
+                        s_ctex[s_ctex_count].w = (int)w;
+                        s_ctex[s_ctex_count].h = (int)h;
+                        s_ctex_count++;
+                    } else {
+                        free(rgba);
+                    }
+                }
+            }
             p += 20;
         } else {
             p += 4;
@@ -128,9 +161,13 @@ static void load_car(larush_k9 *k9, const char *want) {
     sorted[nvb] = size[2];
 
     car_vtx *vts = malloc(sizeof(car_vtx) * (size[2] / 20 + 1));
+    float *uvs = malloc(sizeof(float) * 2 * (size[2] / 20 + 1));
     uint32_t *vbase = malloc(sizeof(uint32_t) * (size_t)(nvb + 1));
     uint32_t *vcnt  = malloc(sizeof(uint32_t) * (size_t)(nvb + 1));
-    if (!vts || !vbase || !vcnt) { free(vts); free(vbase); free(vcnt); return; }
+    if (!vts || !uvs || !vbase || !vcnt) {
+        free(vts); free(uvs); free(vbase); free(vcnt);
+        return;
+    }
     uint32_t n = 0;
     for (int b = 0; b < nvb; b++) {
         uint32_t bo = dorder[b], bs = 0;
@@ -148,6 +185,11 @@ static void load_car(larush_k9 *k9, const char *want) {
             vts[n].x = (float)v[0] / 1000.0f;
             vts[n].y = (float)v[1] / 1000.0f;
             vts[n].z = (float)v[2] / 1000.0f;
+            /* UVs: slots 6-7, fixed-point /2048. */
+            int16_t uv[2];
+            memcpy(uv, payload + bo + i * 20 + 12, 4);
+            uvs[n * 2 + 0] = (float)uv[0] / 2048.0f;
+            uvs[n * 2 + 1] = (float)uv[1] / 2048.0f;
             n++;
         }
         /* Coherent buffers also feed the heuristic-strip fallback. */
@@ -157,6 +199,7 @@ static void load_car(larush_k9 *k9, const char *want) {
         }
     }
     s_car = vts;
+    s_car_uv = uvs;
     s_car_count = n;
 
     /* ── Exact topology from the info-block chunk table ────────
@@ -195,13 +238,18 @@ static void load_car(larush_k9 *k9, const char *want) {
         uint32_t idx0 = last + 40;             /* index pool start */
         if (idx0 + 2u * total_idx <= size[0]) {
             s_tris = malloc(sizeof(uint32_t) * 3u * total_idx);
+            s_tri_tex = malloc(total_idx);
             uint32_t nt = 0;
-            for (int c = 0; c < nchunk && c < nvb && s_tris; c++) {
-                uint32_t cum; uint16_t ni, nv;
+            for (int c = 0; c < nchunk && c < nvb && s_tris &&
+                            s_tri_tex; c++) {
+                uint32_t cum, prt; uint16_t ni, nv;
                 memcpy(&cum, inf + first + (uint32_t)c * 40, 4);
                 memcpy(&ni,  inf + first + (uint32_t)c * 40 + 8, 2);
                 memcpy(&nv,  inf + first + (uint32_t)c * 40 + 10, 2);
+                memcpy(&prt, inf + first + (uint32_t)c * 40 + 36, 4);
                 if (nv > vcnt[c]) continue;    /* mapping mismatch */
+                uint8_t tex = (s_ctex_count && prt < (uint32_t)s_ctex_count)
+                              ? (uint8_t)prt : 0xFF;
                 const uint8_t *ix = inf + idx0 + 2u * cum;
                 for (uint32_t i = 2; i < ni; i++) {
                     uint16_t a, b2, c2;
@@ -214,6 +262,7 @@ static void load_car(larush_k9 *k9, const char *want) {
                     s_tris[nt * 3 + 0] = vbase[c] + a;
                     s_tris[nt * 3 + 1] = vbase[c] + b2;
                     s_tris[nt * 3 + 2] = vbase[c] + c2;
+                    s_tri_tex[nt] = tex;
                     nt++;
                 }
             }
@@ -245,7 +294,10 @@ static uint32_t s_fb[FB_W * FB_H];
 static float s_zbuf[FB_W * FB_H];
 static float s_vx[16384], s_vy[16384], s_vz[16384];   /* view space */
 
-static void fill_tri(int i0, int i1, int i2, uint32_t color) {
+/* Fill one triangle.  tex = 0xFF → flat `color`; otherwise sample
+ * s_ctex[tex] with perspective-correct UVs and modulate by `lit`. */
+static void fill_tri(int i0, int i1, int i2, uint32_t color,
+                     uint8_t tex, float lit) {
     float x0 = s_vx[i0], y0 = s_vy[i0], z0 = s_vz[i0];
     float x1 = s_vx[i1], y1 = s_vy[i1], z1 = s_vz[i1];
     float x2 = s_vx[i2], y2 = s_vy[i2], z2 = s_vz[i2];
@@ -258,6 +310,15 @@ static void fill_tri(int i0, int i1, int i2, uint32_t color) {
     float area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
     if (area == 0.0f) return;
     float inv = 1.0f / area;
+
+    float q0 = 1.0f / z0, q1 = 1.0f / z1, q2 = 1.0f / z2;
+    float u0 = 0, v0 = 0, u1 = 0, v1 = 0, u2 = 0, v2 = 0;
+    if (tex != 0xFF) {
+        u0 = s_car_uv[i0 * 2] * q0; v0 = s_car_uv[i0 * 2 + 1] * q0;
+        u1 = s_car_uv[i1 * 2] * q1; v1 = s_car_uv[i1 * 2 + 1] * q1;
+        u2 = s_car_uv[i2 * 2] * q2; v2 = s_car_uv[i2 * 2 + 1] * q2;
+    }
+
     for (int y = miny; y <= maxy; y++)
         for (int x = minx; x <= maxx; x++) {
             float w0 = ((x1 - (float)x) * (y2 - (float)y) -
@@ -268,7 +329,25 @@ static void fill_tri(int i0, int i1, int i2, uint32_t color) {
             if (w0 < 0 || w1 < 0 || w2 < 0) continue;
             float z = w0 * z0 + w1 * z1 + w2 * z2;
             int o = y * FB_W + x;
-            if (z < s_zbuf[o]) { s_zbuf[o] = z; s_fb[o] = color; }
+            if (z >= s_zbuf[o]) continue;
+            s_zbuf[o] = z;
+            if (tex == 0xFF) {
+                s_fb[o] = color;
+                continue;
+            }
+            float q = w0 * q0 + w1 * q1 + w2 * q2;
+            float u = (w0 * u0 + w1 * u1 + w2 * u2) / q;
+            float v = (w0 * v0 + w1 * v1 + w2 * v2) / q;
+            u -= floorf(u);                     /* wrap */
+            v -= floorf(v);
+            int tw = s_ctex[tex].w, th = s_ctex[tex].h;
+            uint32_t texel = s_ctex[tex].rgba[
+                (int)(v * (float)(th - 1)) * tw +
+                (int)(u * (float)(tw - 1))];
+            uint32_t r = (uint32_t)((float)(texel & 0xFF) * lit);
+            uint32_t g = (uint32_t)((float)((texel >> 8) & 0xFF) * lit);
+            uint32_t b = (uint32_t)((float)((texel >> 16) & 0xFF) * lit);
+            s_fb[o] = ABGR(r, g, b, 0xFF);
         }
 }
 
@@ -290,11 +369,17 @@ static void draw_car(uint32_t frame) {
         s_vz[i] = cz;
     }
 
-    /* Ground plane wash first (under the car). */
+    /* Showroom backdrop: warm gradient + lighter floor. */
+    for (int y = 0; y < FB_H; y++) {
+        uint8_t g = (uint8_t)(0x30 + y * 0x28 / FB_H);
+        uint32_t c = ABGR(g, (uint8_t)(g * 2 / 3), (uint8_t)(g / 2), 0xFF);
+        for (int x = 0; x < FB_W; x++)
+            s_fb[y * FB_W + x] = c;
+    }
     int gy = FB_H / 2 + 30 + (int)(0.32f * 620.0f / CAMD);
     for (int y = gy; y < FB_H; y++)
         for (int x = 0; x < FB_W; x++)
-            s_fb[y * FB_W + x] = ABGR(0x22, 0x14, 0x20, 0xFF);
+            s_fb[y * FB_W + x] = ABGR(0x4A, 0x38, 0x36, 0xFF);
 
     /* Two-sided flat shading, light from upper-front-left. */
     const float lx = -0.45f, ly = 0.78f, lz = -0.43f;
@@ -316,10 +401,12 @@ static void draw_car(uint32_t frame) {
             float rnz = nx * sa + nz * ca;
             float lit = (rnx * lx + ny * ly + rnz * lz) / nl;
             if (lit < 0) lit = -lit;             /* two-sided */
-            float d = 0.25f + 0.75f * lit;
+            float d = 0.45f + 0.75f * lit;
+            if (d > 1.0f) d = 1.0f;
             fill_tri((int)i0, (int)i1, (int)i2,
                      ABGR((uint8_t)(235 * d), (uint8_t)(90 * d),
-                          (uint8_t)(45 * d), 0xFF));
+                          (uint8_t)(45 * d), 0xFF),
+                     s_tri_tex[t], d);
         }
         return;
     }
@@ -348,7 +435,7 @@ static void draw_car(uint32_t frame) {
             float d = 0.25f + 0.75f * lit;
             fill_tri((int)i, (int)i + 1, (int)i + 2,
                      ABGR((uint8_t)(235 * d), (uint8_t)(90 * d),
-                          (uint8_t)(45 * d), 0xFF));
+                          (uint8_t)(45 * d), 0xFF), 0xFF, d);
         }
     }
 }
