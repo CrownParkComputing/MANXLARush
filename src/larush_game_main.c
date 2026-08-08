@@ -36,9 +36,11 @@ extern uint32_t  larush_kernel_heap_alloc(uint32_t size, uint32_t align);
 #define STACK_ARG(n) MEM32(g_esp + 4 + (uint32_t)((n) * 4))
 extern uint32_t g_esp;
 
-static uint32_t s_max_frames = 3;
+static uint32_t s_max_frames = 3;   /* 0 = run until stop requested */
+static int s_stop_requested = 0;
 
 void larush_game_main_set_frames(uint32_t n) { s_max_frames = n; }
+void larush_game_main_request_stop(void) { s_stop_requested = 1; }
 
 /* ── native CRT malloc (0x001F20AB) ────────────────────────── */
 
@@ -227,13 +229,17 @@ static void game_main_native(void) {
     MEM32(0x00384C44u) = 0;
 
     /* ── the game loop (0x00087B00) ── */
-    fprintf(stderr, "larush_main: entering game loop for %u frames\n",
-            s_max_frames);
-    for (uint32_t f = 0; f < s_max_frames; f++)
+    if (s_max_frames)
+        fprintf(stderr, "larush_main: entering game loop for %u frames\n",
+                s_max_frames);
+    else
+        fprintf(stderr, "larush_main: entering game loop (until stop)\n");
+    s_stop_requested = 0;
+    for (uint32_t f = 0; (!s_max_frames || f < s_max_frames) &&
+                         !s_stop_requested; f++)
         game_frame();
-    fprintf(stderr, "larush_main: game loop ran %u frames "
-            "(counter [0x340B70] = %u)\n",
-            s_max_frames, MEM32(0x00340B70u));
+    fprintf(stderr, "larush_main: game loop exited "
+            "(counter [0x340B70] = %u)\n", MEM32(0x00340B70u));
     g_eax = 0;
 }
 

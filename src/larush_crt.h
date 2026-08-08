@@ -107,7 +107,8 @@ uint32_t larush_crt_run(void);
  * main (0x00087860) plus the CRT malloc it uses into the native
  * registry; the game loop then runs the configured frame count. */
 void larush_game_main_register(void);
-void larush_game_main_set_frames(uint32_t n);
+void larush_game_main_set_frames(uint32_t n);   /* 0 = until stop */
+void larush_game_main_request_stop(void);
 
 /* Individual stages, exposed for tests. */
 void larush_crt_entry(void);            /* 0x001B2594 */

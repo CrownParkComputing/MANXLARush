@@ -109,10 +109,25 @@ XBE header fields:
       `larush_crt_call`, which records the pending hit-list:
       **17 init functions + 11 per-frame functions** (printed by
       `LARushCRTTest` with call counts and roles)
+- [x] **The recompiled game loop is on screen**: `LARushGameLoop`
+      registers SDL-bridge natives at the loop's real render/present
+      VAs (`0x000EA4A0`/`0x000E8E10`), so every displayed frame is
+      driven by recompiled `main` — the on-screen counter is
+      `MEM32(0x340B70)`.  Attract rotation cycles real frontend art
+      (car-select atlas, L.A. street menu backgrounds) via the k9 VFS;
+      `--dump` writes headless PPM snapshots
+- [x] Colour fix: `dxt_decode.h` emits RGBA **byte order**
+      (`0xAABBGGRR` words); the SDL/PPM consumers were treating words
+      as `0xRRGGBBAA`, flooding red (alpha shown as red, green as
+      blue…).  All consumers now use `SDL_PIXELFORMAT_ABGR8888` /
+      byte-wise writes.  NOTE: `MANXFlatOut1/tools/flatout1_boot.c`
+      uses `SDL_PIXELFORMAT_RGBA8888` with the same decoder — the same
+      bug, worth fixing there
 - [ ] Port main's callees off the hit-list — likely order: engine init
       `0x0017C930` (676 insns, gates most globals), then the per-frame
       eleven (state step `0x00087BC0`, world `0x000F3F20`, render
       `0x000EA4A0`, present `0x000E8E10`, …) toward real frames
+      replacing the attract bridge
 - [ ] Recompile the C++ static ctor table on demand (**2,228 live
       initializers** at `0x002D5DB0–0x002D8084`) as main's callees
       need them
@@ -126,6 +141,8 @@ XBE header fields:
 |---|---|
 | `src/larush_crt.c/.h` | hand-recompiled CRT entry chain (entry → TLS → ctor walks → main dispatch) + native registry, arg-frame dispatch, pending hit-list |
 | `src/larush_game_main.c` | hand-recompiled `main` 0x00087860: init sequence + the game loop |
+| `tools/larush_game_loop.c` | the recompiled loop on screen: SDL bridge natives at render/present VAs |
+| `tools/k9_texture.h` | shared k9 texture-package picker (boot + game loop) |
 | `tools/larush_crt_test.c` | CRT chain diagnostic: retail cross-check + synthetic self-test |
 | `src/larush_kernel_shim.c` | Xbox kernel layer (thunk table 0x002BFF48×256, stubs, dispatch) |
 | `src/larush_first_boot.c` | XBE loader + kernel init + ordinal diagnostic + synthetic self-test |

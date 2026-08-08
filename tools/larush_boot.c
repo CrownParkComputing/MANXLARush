@@ -16,7 +16,7 @@
 
 extern void larush_kernel_set_k9(larush_k9 *k9);
 
-#include "dxt_decode.h"
+#include "k9_texture.h"
 
 #include <SDL3/SDL.h>
 #include <stdint.h>
@@ -25,86 +25,6 @@ extern void larush_kernel_set_k9(larush_k9 *k9);
 #include <string.h>
 #include <sys/stat.h>
 #include <dirent.h>
-
-/* ── k9 texture package parsing ──────────────────────────────
- *
- * Each .dir/.res entry is a texture package of three blocks:
- *   block 0: info — 0x34-byte header, then {char name[16]; u32
- *            desc_byte_off} records naming descriptors
- *   block 1: Xbox D3DTexture descriptors, 20 bytes each:
- *            {u32 Common, u32 Data, u32 Lock, u32 Format, u32 Size}
- *            Common == 0x0004xxxx for textures; Data = payload offset;
- *            Format: fmt byte = (>>8)&0xFF (0x0C=DXT1, 0x0E=DXT3,
- *            0x0F=DXT5), USize = 1<<((>>20)&0xF), VSize = 1<<((>>24)&0xF)
- *   block 2: raw texel payload (DXT blocks are linear, not swizzled)
- */
-
-#define XT_FMT_DXT1 0x0Cu
-#define XT_FMT_DXT3 0x0Eu
-#define XT_FMT_DXT5 0x0Fu
-
-typedef struct {
-    uint32_t width, height, four_cc;
-    const uint8_t *pixels;
-    uint32_t pixel_bytes;
-    char name[20];
-} k9_texture;
-
-/* Pick the largest decodable DXT texture in entry `idx` of `k9`. */
-static int k9_pick_texture(larush_k9 *k9, uint32_t idx, k9_texture *out) {
-    uint32_t off[3], size[3];
-    const uint8_t *entry; uint32_t entry_len;
-    if (!larush_k9_entry_blocks(k9, idx, off, size)) return 0;
-    if (!larush_k9_find_by_index(k9, idx, &entry, &entry_len)) return 0;
-
-    const uint8_t *info    = entry + (off[0] - off[0]);
-    const uint8_t *descs   = entry + (off[1] - off[0]);
-    const uint8_t *payload = entry + (off[2] - off[0]);
-
-    uint32_t desc_bytes = size[1];
-    uint32_t best_area = 0;
-    uint32_t best_off = 0;
-    for (uint32_t d = 0; d + 20 <= desc_bytes; d += 20) {
-        uint32_t common, data, format;
-        memcpy(&common, descs + d + 0, 4);
-        memcpy(&data,   descs + d + 4, 4);
-        memcpy(&format, descs + d + 12, 4);
-        if ((common & 0x00070000u) != 0x00040000u) continue;
-        uint32_t fmt = (format >> 8) & 0xFFu;
-        uint32_t w = 1u << ((format >> 20) & 0xFu);
-        uint32_t h = 1u << ((format >> 24) & 0xFu);
-        if (fmt != XT_FMT_DXT1 && fmt != XT_FMT_DXT3 && fmt != XT_FMT_DXT5)
-            continue;
-        if (w < 8 || h < 8 || w > 2048 || h > 2048) continue;
-        size_t need = ((w + 3) / 4) * ((h + 3) / 4) *
-                      (fmt == XT_FMT_DXT1 ? 8 : 16);
-        if (data + need > size[2]) continue;
-        if (w * h > best_area) {
-            best_area = w * h;
-            best_off = d;
-            out->width = w;
-            out->height = h;
-            out->four_cc = fmt == XT_FMT_DXT1 ? FOURCC_DXT1 :
-                           fmt == XT_FMT_DXT3 ? FOURCC_DXT3 : FOURCC_DXT5;
-            out->pixels = payload + data;
-            out->pixel_bytes = (uint32_t)need;
-        }
-    }
-    if (!best_area) return 0;
-
-    /* Resolve the winner's name from the info block. */
-    snprintf(out->name, sizeof(out->name), "tex@+0x%X", best_off);
-    for (uint32_t n = 0x34; n + 20 <= size[0]; n += 20) {
-        uint32_t desc_off;
-        memcpy(&desc_off, info + n + 16, 4);
-        if (desc_off == best_off && info[n] >= 32 && info[n] < 127) {
-            snprintf(out->name, sizeof(out->name), "%.16s",
-                     (const char *)(info + n));
-            break;
-        }
-    }
-    return 1;
-}
 
 /* Procedural placeholder: LA sunset gradient with a road vanishing
  * toward the horizon — rendered so the SDL path is testable with no
@@ -139,8 +59,9 @@ static uint32_t *make_placeholder(int w, int h) {
                     b = (uint8_t)(24 + 6 * depth);
                 }
             }
-            px[y * w + x] = ((uint32_t)r << 24) | ((uint32_t)g << 16) |
-                            ((uint32_t)b << 8) | 0xFFu;
+            /* RGBA byte order (0xAABBGGRR words), matching dxt_decode. */
+            px[y * w + x] = 0xFF000000u | ((uint32_t)b << 16) |
+                            ((uint32_t)g << 8) | r;
         }
     }
     return px;
@@ -151,8 +72,8 @@ static int dump_ppm(const char *path, const uint32_t *px, int w, int h) {
     if (!f) return 0;
     fprintf(f, "P6\n%d %d\n255\n", w, h);
     for (int i = 0; i < w * h; i++) {
-        uint8_t rgb[3] = { (uint8_t)(px[i] >> 24), (uint8_t)(px[i] >> 16),
-                           (uint8_t)(px[i] >> 8) };
+        uint8_t rgb[3] = { (uint8_t)(px[i]), (uint8_t)(px[i] >> 8),
+                           (uint8_t)(px[i] >> 16) };
         fwrite(rgb, 1, 3, f);
     }
     return fclose(f) == 0;
@@ -273,7 +194,7 @@ int main(int argc, char **argv) {
     SDL_Texture *tex = NULL;
     if (decoded_pixels && tex_w > 0 && tex_h > 0) {
         SDL_Surface *s = SDL_CreateSurfaceFrom(
-            tex_w, tex_h, SDL_PIXELFORMAT_RGBA8888,
+            tex_w, tex_h, SDL_PIXELFORMAT_ABGR8888,
             decoded_pixels, tex_w * 4);
         if (s) {
             tex = SDL_CreateTextureFromSurface(renderer, s);
