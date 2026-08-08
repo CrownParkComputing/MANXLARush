@@ -68,3 +68,24 @@ foreach(target LARushProbe LARushFirstBoot LARushD3DProbe LARushK9Test
     target_compile_options(${target} PRIVATE
         -O2 -Wall -Wextra -Wpedantic -UNDEBUG -Wno-unused-function)
 endforeach()
+
+# ── Stage C: 32-bit native-execution harness ──────────────────────────
+#
+# The retail XBE is 32-bit x86; LARushNative runs it in-process at its
+# true VAs, so it must be a 32-bit ELF — a separate ABI, built via
+# ExternalProject with the i686 toolchain file.  Opt-in (needs a 32-bit
+# toolchain + lib32 zlib): -DLARUSH_BUILD_NATIVE32=ON.
+option(LARUSH_BUILD_NATIVE32 "Build the 32-bit native-execution harness" OFF)
+if(LARUSH_BUILD_NATIVE32)
+    include(ExternalProject)
+    ExternalProject_Add(native32
+        SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/native32
+        CMAKE_ARGS
+            -DCMAKE_TOOLCHAIN_FILE=${CMAKE_CURRENT_SOURCE_DIR}/cmake/i686-linux.cmake
+            -DCMAKE_BUILD_TYPE=$<CONFIG>
+        BINARY_DIR ${CMAKE_BINARY_DIR}/native32
+        INSTALL_COMMAND ""
+        BUILD_ALWAYS ON)
+    add_test(NAME larush_native_smoke
+        COMMAND ${CMAKE_BINARY_DIR}/native32/LARushNative --self-test)
+endif()

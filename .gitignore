@@ -13,3 +13,4 @@ __pycache__/
 /.venv/
 .claude/
 compile_commands.json
+build-native32/
