@@ -23,6 +23,7 @@ find_package(ZLIB REQUIRED)
 
 add_library(larush_port STATIC
     src/larush_crt.c
+    src/larush_game_main.c
     src/larush_k9_vfs.c
     src/larush_kernel_shim.c)
 target_include_directories(larush_port PUBLIC src)

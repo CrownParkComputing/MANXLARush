@@ -12,3 +12,4 @@ __pycache__/
 *.pyc
 /.venv/
 .claude/
+compile_commands.json

@@ -87,10 +87,27 @@ const larush_crt_state *larush_crt_get_state(void);
  * pending.  Returns 0 when the registry is full. */
 int larush_crt_register_native(uint32_t xbox_va, void (*fn)(void));
 
+/* Dispatch a call from recompiled code.  If a native is registered it
+ * runs with the given stack arguments staged at g_esp+4 (STACK_ARG
+ * layout) and 1 is returned; otherwise the target is recorded in the
+ * pending table (the recompile hit-list) and 0 is returned. */
+int larush_crt_call(uint32_t va, const char *what);
+int larush_crt_call_args(uint32_t va, const char *what,
+                         const uint32_t *args, int n);
+int larush_crt_pending_total(void);
+int larush_crt_pending_get(int i, uint32_t *va, const char **what,
+                           uint32_t *count);
+
 /* Run the full chain: entry → thread trampoline → mainCRTStartup →
  * main dispatch.  Returns the exit code (g_eax of main when a native
  * main is registered, 0 otherwise). */
 uint32_t larush_crt_run(void);
+
+/* Hand-recompiled main (src/larush_game_main.c).  Registering wires
+ * main (0x00087860) plus the CRT malloc it uses into the native
+ * registry; the game loop then runs the configured frame count. */
+void larush_game_main_register(void);
+void larush_game_main_set_frames(uint32_t n);
 
 /* Individual stages, exposed for tests. */
 void larush_crt_entry(void);            /* 0x001B2594 */

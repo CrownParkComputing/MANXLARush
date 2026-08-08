@@ -43,6 +43,65 @@ static void (*native_for(uint32_t va))(void) {
     return NULL;
 }
 
+/* ── Pending-call tracker + dispatch with an argument frame ──
+ *
+ * Recompiled code calls original functions through larush_crt_call*.
+ * Registered natives run with their stack arguments staged in Xbox
+ * memory (g_esp points at the return-address slot, args at +4, the
+ * same frame shape the kernel stubs' STACK_ARG uses).  Unregistered
+ * targets are recorded: the sorted table is the recompile hit-list. */
+
+extern uint32_t g_esp;
+
+#define CRT_PENDING_MAX 128
+
+static struct { uint32_t va; const char *what; uint32_t count; }
+    s_pending[CRT_PENDING_MAX];
+static int s_pending_count = 0;
+
+static void record_pending(uint32_t va, const char *what) {
+    for (int i = 0; i < s_pending_count; i++)
+        if (s_pending[i].va == va) { s_pending[i].count++; return; }
+    if (s_pending_count >= CRT_PENDING_MAX) return;
+    s_pending[s_pending_count].va = va;
+    s_pending[s_pending_count].what = what;
+    s_pending[s_pending_count].count = 1;
+    s_pending_count++;
+    fprintf(stderr, "larush_crt: pending 0x%08X — %s\n", va, what);
+}
+
+int larush_crt_pending_total(void) { return s_pending_count; }
+
+int larush_crt_pending_get(int i, uint32_t *va, const char **what,
+                           uint32_t *count) {
+    if (i < 0 || i >= s_pending_count) return 0;
+    if (va)    *va    = s_pending[i].va;
+    if (what)  *what  = s_pending[i].what;
+    if (count) *count = s_pending[i].count;
+    return 1;
+}
+
+int larush_crt_call_args(uint32_t va, const char *what,
+                         const uint32_t *args, int n) {
+    void (*fn)(void) = native_for(va);
+    if (!fn) { record_pending(va, what); return 0; }
+
+    static uint32_t s_frame = 0;      /* 0x200-byte arg frame in heap */
+    if (!s_frame) s_frame = larush_kernel_heap_alloc(0x200, 16);
+    uint32_t saved_esp = g_esp;
+    g_esp = s_frame;
+    MEM32(g_esp) = 0;                 /* fake return address slot */
+    for (int i = 0; i < n && i < 0x7E; i++)
+        MEM32(g_esp + 4u + 4u * (uint32_t)i) = args[i];
+    fn();
+    g_esp = saved_esp;
+    return 1;
+}
+
+int larush_crt_call(uint32_t va, const char *what) {
+    return larush_crt_call_args(va, what, NULL, 0);
+}
+
 /* ── entry 0x001B2594 ──────────────────────────────────────── */
 
 void larush_crt_entry(void) {

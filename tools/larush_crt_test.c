@@ -148,7 +148,9 @@ static int retail(const char *data_dir) {
     for (uint32_t va = LARUSH_CTOR_TABLE_LO; va < LARUSH_CTOR_TABLE_HI; va += 4)
         if (MEM32(va) != 0 && MEM32(va) != 0xFFFFFFFFu) expect_ctors++;
 
-    printf("\n── Running chain ──\n");
+    printf("\n── Running chain (native main, 3 frames) ──\n");
+    larush_game_main_register();
+    larush_game_main_set_frames(3);
     larush_crt_run();
     const larush_crt_state *cs = larush_crt_get_state();
 
@@ -164,6 +166,12 @@ static int retail(const char *data_dir) {
           cs->ctor_total, expect_ctors);
     CHECK(cs->reached_main_va == LARUSH_MAIN_VA,
           "main VA 0x%08X", cs->reached_main_va);
+    CHECK(cs->main_native == 1, "main did not dispatch natively");
+    CHECK(MEM32(0x00340B70u) == 3, "frame counter %u",
+          MEM32(0x00340B70u));
+    CHECK(MEM32(0x003DEB70u) != 0 && MEM32(0x003DEB6Cu) != 0,
+          "malloc'd descriptor block 0x%08X/0x%08X",
+          MEM32(0x003DEB70u), MEM32(0x003DEB6Cu));
 
     printf("\n── Recompilation frontier ──\n");
     printf("C++ static ctor table: %u live initializers, %u pending\n",
@@ -179,6 +187,14 @@ static int retail(const char *data_dir) {
     }
     printf("main: 0x%08X (%s)\n", LARUSH_MAIN_VA,
            cs->main_native ? "native" : "pending recompilation");
+
+    printf("\n── Pending calls from recompiled main "
+           "(the hit-list) ──\n");
+    for (int i = 0; i < larush_crt_pending_total(); i++) {
+        uint32_t va, count; const char *what;
+        larush_crt_pending_get(i, &va, &what, &count);
+        printf("  0x%08X  ×%-4u %s\n", va, count, what);
+    }
 
     larush_kernel_shutdown();
     xbox_MemoryLayoutShutdown();

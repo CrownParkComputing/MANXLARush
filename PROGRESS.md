@@ -100,9 +100,22 @@ XBE header fields:
       `LARushCRTTest` verifies every written value against an
       independent recomputation from the retail image; synthetic
       `--self-test` runs in ctest with no game data
-- [ ] Recompile `main` (`0x00087860`, 205 insns) and the C++ static
-      ctor table (**2,228 live initializers** at `0x002D5DB0–0x002D8084`)
-      through the native registry toward a running game loop
+- [x] Recompile `main` (`0x00087860`, 205 insns → `src/larush_game_main.c`):
+      every global write faithful via MEM32/MEM16/MEM8, register-passed
+      args via `g_eax/g_edx/g_ebx/g_edi`, CRT malloc (`0x001F20AB`)
+      implemented natively.  **The game loop (`0x00087B00`) runs** — a
+      configurable frame count with the frame counter live at
+      `[0x340B70]`.  Unported callees are dispatched through
+      `larush_crt_call`, which records the pending hit-list:
+      **17 init functions + 11 per-frame functions** (printed by
+      `LARushCRTTest` with call counts and roles)
+- [ ] Port main's callees off the hit-list — likely order: engine init
+      `0x0017C930` (676 insns, gates most globals), then the per-frame
+      eleven (state step `0x00087BC0`, world `0x000F3F20`, render
+      `0x000EA4A0`, present `0x000E8E10`, …) toward real frames
+- [ ] Recompile the C++ static ctor table on demand (**2,228 live
+      initializers** at `0x002D5DB0–0x002D8084`) as main's callees
+      need them
 - [ ] Full `.res` texture-package descriptor doc + per-mip extraction
 - [ ] XACT (`.xsb`/`.xwb`) audio + XMV/WMA FMV via `MANXFramework::FMV`
 - [ ] Give the 17 new kernel ordinals real semantics from call-site disasm
@@ -111,7 +124,8 @@ XBE header fields:
 
 | File | Purpose |
 |---|---|
-| `src/larush_crt.c/.h` | hand-recompiled CRT entry chain (entry → TLS → ctor walks → main dispatch) |
+| `src/larush_crt.c/.h` | hand-recompiled CRT entry chain (entry → TLS → ctor walks → main dispatch) + native registry, arg-frame dispatch, pending hit-list |
+| `src/larush_game_main.c` | hand-recompiled `main` 0x00087860: init sequence + the game loop |
 | `tools/larush_crt_test.c` | CRT chain diagnostic: retail cross-check + synthetic self-test |
 | `src/larush_kernel_shim.c` | Xbox kernel layer (thunk table 0x002BFF48×256, stubs, dispatch) |
 | `src/larush_first_boot.c` | XBE loader + kernel init + ordinal diagnostic + synthetic self-test |
