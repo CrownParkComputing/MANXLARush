@@ -134,12 +134,18 @@ XBE header fields:
       placement matrices.  The garage renders **flat-shaded z-buffered
       triangles** from the strip-ordered vertices (over-long edges
       dropped as strip restarts) with vertex splats filling holes
-- [ ] Exact car topology: mesh records in the info block are ~240 B
-      (name, material, mesh id, index counts like 0xDDA); a u16 region
-      at `info+0x30CC..0xC7F4` (~19K values, max = vtx_count−1) holds
-      the index data, but neither plain strip nor plain list decode
-      cleanly, and part of it is an ascending-first edge/adjacency
-      table — needs a proper record-layout reverse
+- [x] **Exact car topology decoded.**  Info block (block 0) layout:
+      0x34-byte header (record count at +0x04, total index count at
+      +0x2C), then 48-byte mesh records `{-1,-1, packed, 0, -1, 0,
+      char name[16], u32 index_count, u32 id}` (short names leave
+      stale "material" text in the field), then a table of **40-byte
+      chunk descriptors** `{u32 cum_index_start; u32 f2; u16 nidx;
+      u16 nvtx; f32 bbox[6]; u32 part_id}` — one per vertex buffer in
+      descriptor order (nvtx == the VB's vertex count) — immediately
+      followed by the u16 index pool.  Indices are **triangle strips
+      with degenerate stitching, local to each chunk's buffer** (car
+      01: 10,916 clean triangles, zero over-long edges).  The garage
+      renders the exact mesh; heuristic strips remain as fallback
 - [ ] Port main's callees off the hit-list — likely order: engine init
       `0x0017C930` (676 insns, gates most globals), then the per-frame
       eleven (state step `0x00087BC0`, world `0x000F3F20`, render

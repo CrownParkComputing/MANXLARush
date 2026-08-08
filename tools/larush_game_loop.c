@@ -76,6 +76,11 @@ static char s_car_name[24] = "";
 static uint32_t s_strip[300];
 static int s_strip_count = 0;
 
+/* Exact topology (when the info-block chunk table decodes):
+ * triangles as global-index triples into s_car. */
+static uint32_t *s_tris = NULL;
+static uint32_t s_tri_count = 0;
+
 static void load_car(larush_k9 *k9, const char *want) {
     uint32_t idx = (uint32_t)-1;
     for (uint32_t i = 0; i < larush_k9_entry_count(k9); i++) {
@@ -93,16 +98,20 @@ static void load_car(larush_k9 *k9, const char *want) {
     const uint8_t *desc    = entry + (off[1] - off[0]);
     const uint8_t *payload = entry + (off[2] - off[0]);
 
-    /* Collect buffer start offsets from the 12-byte records. */
-    uint32_t starts[256]; int nstarts = 0;
+    const uint8_t *inf = entry;               /* block 0 */
+
+    /* Collect buffer start offsets from the 12-byte records, keeping
+     * DESCRIPTOR order — the info-block chunk table maps 1:1 onto it. */
+    uint32_t dorder[256], sorted[257];
+    int nvb = 0;
     uint32_t p = 0;
-    while (p + 12 <= size[1] && nstarts < 255) {
+    while (p + 12 <= size[1] && nvb < 255) {
         uint32_t common, data, lock;
         memcpy(&common, desc + p + 0, 4);
         memcpy(&data,   desc + p + 4, 4);
         memcpy(&lock,   desc + p + 8, 4);
         if (common == 0x00800001u && lock == 0 && data < size[2]) {
-            starts[nstarts++] = data;
+            dorder[nvb++] = data;
             p += 12;
         } else if ((common & 0x00070000u) == 0x00040000u) {
             p += 20;
@@ -110,45 +119,112 @@ static void load_car(larush_k9 *k9, const char *want) {
             p += 4;
         }
     }
-    /* Sort ascending; sizes are the gaps. */
-    for (int i = 1; i < nstarts; i++)
-        for (int j = i; j > 0 && starts[j] < starts[j-1]; j--) {
-            uint32_t t = starts[j]; starts[j] = starts[j-1];
-            starts[j-1] = t;
+    memcpy(sorted, dorder, sizeof(uint32_t) * (size_t)nvb);
+    for (int i = 1; i < nvb; i++)
+        for (int j = i; j > 0 && sorted[j] < sorted[j-1]; j--) {
+            uint32_t t = sorted[j]; sorted[j] = sorted[j-1];
+            sorted[j-1] = t;
         }
-    starts[nstarts] = size[2];
+    sorted[nvb] = size[2];
 
     car_vtx *vts = malloc(sizeof(car_vtx) * (size[2] / 20 + 1));
-    if (!vts) return;
+    uint32_t *vbase = malloc(sizeof(uint32_t) * (size_t)(nvb + 1));
+    uint32_t *vcnt  = malloc(sizeof(uint32_t) * (size_t)(nvb + 1));
+    if (!vts || !vbase || !vcnt) { free(vts); free(vbase); free(vcnt); return; }
     uint32_t n = 0;
-    for (int b = 0; b < nstarts && s_strip_count < 299; b++) {
-        uint32_t bo = starts[b], bs = starts[b+1] - starts[b];
-        if (bs % 20 || bs < 60) continue;
-        uint32_t bn = bs / 20, inlier = 0;
+    for (int b = 0; b < nvb; b++) {
+        uint32_t bo = dorder[b], bs = 0;
+        for (int k = 0; k < nvb; k++)
+            if (sorted[k] == bo) { bs = sorted[k+1] - bo; break; }
+        vbase[b] = n;
+        vcnt[b] = (bs % 20) ? 0 : bs / 20;
+        uint32_t bn = vcnt[b], inlier = 0;
         for (uint32_t i = 0; i < bn; i++) {
             int16_t v[3];
             memcpy(v, payload + bo + i * 20, 6);
             if (v[0] > -4000 && v[0] < 4000 && v[1] > -4000 &&
                 v[1] < 4000 && v[2] > -4000 && v[2] < 4000)
                 inlier++;
-        }
-        if (inlier * 100 < bn * 98) continue;
-        s_strip[s_strip_count++] = n;
-        for (uint32_t i = 0; i < bn; i++) {
-            int16_t v[3];
-            memcpy(v, payload + bo + i * 20, 6);
             vts[n].x = (float)v[0] / 1000.0f;
             vts[n].y = (float)v[1] / 1000.0f;
             vts[n].z = (float)v[2] / 1000.0f;
             n++;
         }
+        /* Coherent buffers also feed the heuristic-strip fallback. */
+        if (bn >= 3 && inlier * 100 >= bn * 98 && s_strip_count < 298) {
+            s_strip[s_strip_count++] = vbase[b];
+            s_strip[s_strip_count] = n;
+        }
     }
-    s_strip[s_strip_count] = n;
     s_car = vts;
     s_car_count = n;
+
+    /* ── Exact topology from the info-block chunk table ────────
+     *
+     * info: u32 header (total index count at +0x2C), then 48-byte
+     * mesh records, then a table of 40-byte chunk descriptors
+     *   { u32 cum_index_start; u32 f2; u16 nidx; u16 nvtx;
+     *     f32 bbox[6]; u32 part_id; }
+     * one per vertex buffer in descriptor order, immediately followed
+     * by the u16 index pool.  Indices are a triangle STRIP with
+     * degenerate stitching, local to the chunk's own buffer. */
+    uint32_t total_idx = 0;
+    if (size[0] >= 0x34) memcpy(&total_idx, inf + 0x2C, 4);
+    uint32_t last = 0;
+    for (uint32_t q = 0x34; total_idx && q + 40 <= size[0]; q += 4) {
+        uint32_t cum, prt; uint16_t ni, nv;
+        memcpy(&cum, inf + q, 4);
+        memcpy(&ni,  inf + q + 8, 2);
+        memcpy(&nv,  inf + q + 10, 2);
+        memcpy(&prt, inf + q + 36, 4);
+        if (ni && cum + ni == total_idx && cum < total_idx && prt < 200)
+            last = q;                          /* keep the LAST match */
+    }
+    if (last) {
+        /* Walk backward, validating the cumulative chain. */
+        uint32_t first = last;
+        while (first >= 0x34 + 40) {
+            uint32_t cum_prev, cum_here; uint16_t ni_prev;
+            memcpy(&cum_prev, inf + first - 40, 4);
+            memcpy(&ni_prev,  inf + first - 40 + 8, 2);
+            memcpy(&cum_here, inf + first, 4);
+            if (cum_prev + ni_prev != cum_here) break;
+            first -= 40;
+        }
+        int nchunk = (int)((last - first) / 40) + 1;
+        uint32_t idx0 = last + 40;             /* index pool start */
+        if (idx0 + 2u * total_idx <= size[0]) {
+            s_tris = malloc(sizeof(uint32_t) * 3u * total_idx);
+            uint32_t nt = 0;
+            for (int c = 0; c < nchunk && c < nvb && s_tris; c++) {
+                uint32_t cum; uint16_t ni, nv;
+                memcpy(&cum, inf + first + (uint32_t)c * 40, 4);
+                memcpy(&ni,  inf + first + (uint32_t)c * 40 + 8, 2);
+                memcpy(&nv,  inf + first + (uint32_t)c * 40 + 10, 2);
+                if (nv > vcnt[c]) continue;    /* mapping mismatch */
+                const uint8_t *ix = inf + idx0 + 2u * cum;
+                for (uint32_t i = 2; i < ni; i++) {
+                    uint16_t a, b2, c2;
+                    memcpy(&a,  ix + 2u * (i - 2), 2);
+                    memcpy(&b2, ix + 2u * (i - 1), 2);
+                    memcpy(&c2, ix + 2u * i, 2);
+                    if (a == b2 || b2 == c2 || a == c2) continue;
+                    if (a >= vcnt[c] || b2 >= vcnt[c] || c2 >= vcnt[c])
+                        continue;
+                    s_tris[nt * 3 + 0] = vbase[c] + a;
+                    s_tris[nt * 3 + 1] = vbase[c] + b2;
+                    s_tris[nt * 3 + 2] = vbase[c] + c2;
+                    nt++;
+                }
+            }
+            s_tri_count = nt;
+        }
+    }
+    free(vbase); free(vcnt);
     snprintf(s_car_name, sizeof(s_car_name), "car %s", want);
-    printf("garage: car \"%s\", %u vertices from %d buffers\n",
-           want, n, nstarts);
+    printf("garage: car \"%s\", %u vertices, %d buffers, "
+           "%u exact triangles%s\n", want, n, nvb, s_tri_count,
+           s_tri_count ? "" : " (heuristic-strip fallback)");
 }
 
 /* ── CPU compositor (shared by SDL upload and --dump) ──────── */
@@ -222,6 +298,33 @@ static void draw_car(uint32_t frame) {
 
     /* Two-sided flat shading, light from upper-front-left. */
     const float lx = -0.45f, ly = 0.78f, lz = -0.43f;
+
+    if (s_tri_count) {
+        /* Exact topology from the info-block chunk table. */
+        for (uint32_t t = 0; t < s_tri_count; t++) {
+            uint32_t i0 = s_tris[t * 3], i1 = s_tris[t * 3 + 1],
+                     i2 = s_tris[t * 3 + 2];
+            car_vtx a = s_car[i0], b = s_car[i1], c = s_car[i2];
+            float e1x = b.x - a.x, e1y = b.y - a.y, e1z = b.z - a.z;
+            float e2x = c.x - a.x, e2y = c.y - a.y, e2z = c.z - a.z;
+            float nx = e1y * e2z - e1z * e2y;
+            float ny = e1z * e2x - e1x * e2z;
+            float nz = e1x * e2y - e1y * e2x;
+            float nl = sqrtf(nx * nx + ny * ny + nz * nz);
+            if (nl < 1e-9f) continue;
+            float rnx = nx * ca - nz * sa;
+            float rnz = nx * sa + nz * ca;
+            float lit = (rnx * lx + ny * ly + rnz * lz) / nl;
+            if (lit < 0) lit = -lit;             /* two-sided */
+            float d = 0.25f + 0.75f * lit;
+            fill_tri((int)i0, (int)i1, (int)i2,
+                     ABGR((uint8_t)(235 * d), (uint8_t)(90 * d),
+                          (uint8_t)(45 * d), 0xFF));
+        }
+        return;
+    }
+
+    /* Fallback: heuristic strips over the raw vertex order. */
     for (int st = 0; st < s_strip_count; st++) {
         for (uint32_t i = s_strip[st]; i + 2 < s_strip[st + 1]; i++) {
             car_vtx a = s_car[i], b = s_car[i + 1], c = s_car[i + 2];
@@ -238,38 +341,15 @@ static void draw_car(uint32_t frame) {
             float nz = e1x * e2y - e1y * e2x;
             float nl = sqrtf(nx * nx + ny * ny + nz * nz);
             if (nl < 1e-9f) continue;
-            /* Rotate the normal with the model. */
             float rnx = nx * ca - nz * sa;
             float rnz = nx * sa + nz * ca;
             float lit = (rnx * lx + ny * ly + rnz * lz) / nl;
-            if (lit < 0) lit = -lit;             /* two-sided */
+            if (lit < 0) lit = -lit;
             float d = 0.25f + 0.75f * lit;
             fill_tri((int)i, (int)i + 1, (int)i + 2,
                      ABGR((uint8_t)(235 * d), (uint8_t)(90 * d),
                           (uint8_t)(45 * d), 0xFF));
         }
-    }
-
-    /* Vertex splats fill the gaps the heuristic topology leaves
-     * (exact strip tables in the info block are still undecoded). */
-    for (uint32_t i = 0; i < s_car_count; i++) {
-        int px = (int)s_vx[i], py = (int)s_vy[i];
-        float cz = s_vz[i];
-        if (px < 0 || px >= FB_W - 1 || py < 0 || py >= FB_H - 1)
-            continue;
-        float d = (CAMD + 1.6f - cz) / 2.6f;
-        if (d < 0.35f) d = 0.35f;
-        if (d > 1.0f) d = 1.0f;
-        uint32_t c = ABGR((uint8_t)(220 * d), (uint8_t)(95 * d),
-                          (uint8_t)(50 * d), 0xFF);
-        for (int dy = 0; dy < 2; dy++)
-            for (int dx = 0; dx < 2; dx++) {
-                int o = (py + dy) * FB_W + px + dx;
-                if (cz <= s_zbuf[o] + 0.02f) {
-                    s_zbuf[o] = cz;
-                    s_fb[o] = c;
-                }
-            }
     }
 }
 
