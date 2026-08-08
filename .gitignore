@@ -10,3 +10,4 @@ fgui_report.json
 *.log
 __pycache__/
 *.pyc
+/.venv/

@@ -124,13 +124,15 @@ void xbox_MemoryLayoutShutdown(void) {
  *  L.A. Rush kernel thunk table
  * ═══════════════════════════════════════════════════════════════ */
 
-/* ── 0x002BFF48, 256 entries — from the MANXLARush XBE analysis.
- * KERNEL_SYNTH_BASE / KDATA_BASE are provisional: they must sit in a
- * VA hole above all 19 retail sections, which can only be confirmed
- * against the real section map (Stage B1).  0x00F00000 keeps them
- * below XBOX_HEAP_START and far above the thunk table. ── */
-#define KERNEL_THUNK_BASE  0x002BFF48u
-#define KERNEL_THUNK_COUNT 256u
+/* ── 0x002A1620 (.rdata), 144 entries — confirmed against the retail
+ * XBE header: kernel-thunk field at 0x158 ^ retail key 0x5B6D40B6 =
+ * 0x002A1620, and 144 consecutive 0x80000000|ordinal entries live
+ * there.  (The earlier recovered analysis claimed 256 @ 0x002BFF48;
+ * that was wrong.)  The retail image ends at 0x00497760, so the
+ * synthetic dispatch block at 0x00F00000 and KDATA at 0x00F10000 sit
+ * safely between the image top and XBOX_HEAP_START. ── */
+#define KERNEL_THUNK_BASE  0x002A1620u
+#define KERNEL_THUNK_COUNT 144u
 #define KERNEL_SYNTH_BASE  0x00F00000u
 #define KERNEL_SYNTH_END   (KERNEL_SYNTH_BASE + KERNEL_THUNK_COUNT * 4u)
 
@@ -528,6 +530,11 @@ static int kernel_arg_bytes(uint32_t ordinal) {
     case 67: case 196: case 200: case 255: return 40;
     /* Ordinals first seen in FlatOut 1's init table (value-only). */
     case 81: case 87: return 0;
+    /* L.A. Rush ordinals beyond the Burnout 3 set (first boot scan:
+     * 17/65 are data exports, 202/277/289 have stubs above).  Arg
+     * byte counts TBD from disassembly of the call sites. */
+    case 37: case 95: case 167: case 172: case 186: case 199:
+    case 233: case 252: case 270: case 337: return 0;
     default: return 0;
     }
 }

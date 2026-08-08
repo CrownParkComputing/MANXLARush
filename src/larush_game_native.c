@@ -37,10 +37,10 @@ extern ptrdiff_t g_xbox_mem_offset;
 #define MEM32(addr) (*(volatile uint32_t *)((uintptr_t)(addr) + (uintptr_t)g_xbox_mem_offset))
 #define MEM16(addr) (*(volatile uint16_t *)((uintptr_t)(addr) + (uintptr_t)g_xbox_mem_offset))
 
-#define LAR_THUNK_BASE  0x002BFF48u
-#define LAR_THUNK_COUNT 256u
+#define LAR_THUNK_BASE  0x002A1620u
+#define LAR_THUNK_COUNT 144u
 #define LAR_KDATA_BASE  0x00F10000u
-#define XBE_ENTRY_KEY   0xA8FC4E5Au
+#define XBE_ENTRY_KEY   0xA8FC57ABu
 
 /* XDK subsystem sections worth probing for import tables. */
 static const char *const SUBSYSTEM_SECTIONS[] = {
@@ -201,7 +201,7 @@ static int larush_game_native_probe(const char *game_data_path,
 
     {
         const uint8_t *xb = (const uint8_t *)xbe_data;
-        uint32_t entry_raw = *(const uint32_t *)(xb + 0x10C);
+        uint32_t entry_raw = *(const uint32_t *)(xb + 0x128);
         printf("Entry: 0x%08X (raw=0x%08X)\n",
                entry_raw ^ XBE_ENTRY_KEY, entry_raw);
     }

@@ -135,11 +135,75 @@ static void test_archive_layer_stubs(void) {
     remove(path);
 }
 
+static void write_k9z(const char *path, const uint8_t *plain, size_t len) {
+    uLongf clen = compressBound(len);
+    uint8_t *blob = malloc(12 + clen);
+    memcpy(blob, "k9CP", 4);
+    uint32_t usize = (uint32_t)len;
+    memcpy(blob + 4, &usize, 4);
+    memset(blob + 8, 0, 4);
+    compress2(blob + 12, &clen, plain, len, Z_BEST_SPEED);
+    FILE *f = fopen(path, "wb");
+    fwrite(blob, 1, 12 + clen, f);
+    fclose(f);
+    free(blob);
+}
+
+static void test_dir_res_pair(void) {
+    /* Synthetic .dir/.res pair in the retail layout: two records with
+     * contiguous (off,size) triples, k9CP-wrapped like COMPRESSED_*. */
+    enum { RES_LEN = 0x300 };
+    uint8_t res[RES_LEN];
+    for (int i = 0; i < RES_LEN; i++) res[i] = (uint8_t)i;
+
+    uint8_t dir[4 + 2 * 0x38];
+    memset(dir, 0, sizeof(dir));
+    uint32_t head = 0x80000000u | 2u;
+    memcpy(dir, &head, 4);
+    /* rec 0 "alpha": [0x00,0x40) [0x40,0x80) [0x80,0x100) */
+    memcpy(dir + 4, "alpha", 5);
+    uint32_t f0[6] = {0x00, 0x40, 0x40, 0x40, 0x80, 0x80};
+    memcpy(dir + 4 + 0x20, f0, 24);
+    /* rec 1 "beta": [0x100,0x140) [0x140,0x180) [0x180,0x300) */
+    memcpy(dir + 4 + 0x38, "beta", 4);
+    uint32_t f1[6] = {0x100, 0x40, 0x140, 0x40, 0x180, 0x180};
+    memcpy(dir + 4 + 0x38 + 0x20, f1, 24);
+
+    write_k9z("k9unit.dir.k9z", dir, sizeof(dir));
+    write_k9z("k9unit.res.k9z", res, sizeof(res));
+
+    larush_k9 *k9 = larush_k9_open("k9unit.dir.k9z");
+    CHECK(k9 != NULL, "dir/res pair opens");
+    if (k9) {
+        CHECK(larush_k9_entry_count(k9) == 2, "pair has 2 entries");
+        CHECK(k9 && strcmp(larush_k9_entry_name(k9, 1), "beta") == 0,
+              "entry 1 named beta");
+
+        const uint8_t *data; uint32_t len;
+        CHECK(larush_k9_find_by_path(k9, "beta", &data, &len, NULL, NULL),
+              "find_by_path(beta)");
+        CHECK(len == 0x200 && data && data[0] == 0x00 && data[0x10] == 0x10,
+              "beta spans [0x100,0x300) with res bytes");
+
+        uint32_t off[3], size[3];
+        CHECK(larush_k9_entry_blocks(k9, 0, off, size) &&
+              off[2] == 0x80 && size[2] == 0x80,
+              "alpha payload block at [0x80,0x100)");
+
+        CHECK(!larush_k9_find_by_path(k9, "gamma", &data, &len, NULL, NULL),
+              "unknown name not found");
+        larush_k9_close(k9);
+    }
+    remove("k9unit.dir.k9z");
+    remove("k9unit.res.k9z");
+}
+
 int main(void) {
     test_crc32();
     test_k9cp_round_trip();
     test_k9cp_negative();
     test_archive_layer_stubs();
+    test_dir_res_pair();
 
     printf("\n%d failure%s\n", failures, failures == 1 ? "" : "s");
     return failures ? 1 : 0;

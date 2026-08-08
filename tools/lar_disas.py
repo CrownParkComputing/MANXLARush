@@ -7,11 +7,12 @@ to recursively disassemble x86 code starting from the entry point. Follows
 direct calls and unconditional jumps to build a static call graph.
 
 Forked from MANXFlatOut1's fo1_disas.py with L.A. Rush parameters:
-  - kernel thunk table: 256 entries at 0x002BFF48
+  - kernel thunk table: 144 entries at 0x002A1620
   - code regions derived from the executable section flags at load time
     (the k9 build's section layout is not hardcoded)
-  - entry 0x00010184 is probed as direct code first, then as a
-    FlatOut-style (func_ptr, type_id) init table
+  - the real entry (0x001B2594, header field 0x128 ^ retail key) is
+    direct CRT code, so it is used as the trace root directly; the
+    FlatOut-style init-table hypothesis is only a fallback
 
 Usage:
     python3 tools/lar_disas.py game_data/L.A.Rush.USA.XBOX-ZTM/default.xbe
@@ -24,8 +25,8 @@ from capstone import Cs, CS_ARCH_X86, CS_MODE_32
 
 # ── L.A. Rush parameters ──────────────────────────────────────
 
-KERNEL_THUNK_BASE = 0x002BFF48
-KERNEL_THUNK_END  = KERNEL_THUNK_BASE + 256 * 4
+KERNEL_THUNK_BASE = 0x002A1620
+KERNEL_THUNK_END  = KERNEL_THUNK_BASE + 144 * 4
 
 # Synthetic data-export region used by larush_kernel_shim.c
 KDATA_BASE = 0x00F10000
@@ -62,10 +63,14 @@ def load_xbe(path):
         data = f.read()
 
     base = struct.unpack_from('<I', data, 0x104)[0]
-    entry_raw = struct.unpack_from('<I', data, 0x10C)[0]
-    # XBE entry point XOR key is at offset 0x118 (certificate key).
-    xor_key = struct.unpack_from('<I', data, 0x118)[0]
-    entry = entry_raw ^ xor_key
+    # Real XBE header: entry point at 0x128, XORed with the retail or
+    # debug key.  Pick whichever lands inside the image.
+    entry_raw = struct.unpack_from('<I', data, 0x128)[0]
+    size_of_image = struct.unpack_from('<I', data, 0x10C)[0]
+    retail = entry_raw ^ 0xA8FC57AB
+    debug = entry_raw ^ 0x94859D4B
+    entry = retail if base <= retail < base + size_of_image else debug
+    xor_key = 0xA8FC57AB if entry == retail else 0x94859D4B
     nsec = struct.unpack_from('<I', data, 0x11C)[0]
     hdr_off = struct.unpack_from('<I', data, 0x120)[0] - base
 
@@ -363,10 +368,20 @@ def main():
     code_entries = [ptr for _, ptr in jt if ptr != 0 and is_in_code(ptr)]
     print(f"Init-table probe: {len(code_entries)} code pointers in first 32 dwords")
 
+    # If the entry disassembles as a real function (terminates cleanly
+    # in a reasonable span) it IS the CRT root — trust it over jump-table
+    # pointers, which on L.A. Rush resolve into RWX .data and mis-decode
+    # as giant garbage runs.  Only fall back to the init-table hypothesis
+    # when the entry is not plausible code.
+    entry_is_code = term in ('ret', 'jmp', 'thunk', 'jmp_outside') and \
+                    len(insns) >= 10
     candidates = []
-    if direct_score >= 20:
+    if entry_is_code:
         candidates.append(xbe_entry)
-    candidates.extend(code_entries[:20])
+    else:
+        if direct_score >= 20:
+            candidates.append(xbe_entry)
+        candidates.extend(code_entries[:20])
 
     if not candidates:
         print("ERROR: entry is neither plausible code nor an init table!")

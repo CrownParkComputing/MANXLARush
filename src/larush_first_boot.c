@@ -30,14 +30,20 @@ extern uint32_t larush_kernel_slot_ordinal(uint32_t slot);
 extern ptrdiff_t g_xbox_mem_offset;
 #define MEM32(addr) (*(volatile uint32_t *)((uintptr_t)(addr) + (uintptr_t)g_xbox_mem_offset))
 
-/* ── L.A. Rush XBE constants (from the MANXLARush analysis) ── */
+/* ── L.A. Rush XBE constants (verified against the retail image) ──
+ * Entry and thunk-table VAs come from the real XBE header fields:
+ * entry point at offset 0x128 ^ retail key, kernel thunk address at
+ * offset 0x158 ^ retail key.  (The recovered analysis's "entry
+ * 0x00010184" was actually the certificate address at 0x118, and its
+ * "256 thunks @ 0x002BFF48" was wrong — the table is 144 @ 0x002A1620.) */
 #define LAR_IMAGE_BASE   0x00010000u
-#define LAR_ENTRY_VA     0x00010184u
+#define LAR_ENTRY_VA     0x001B2594u   /* in .text — direct code */
 #define LAR_SECTIONS     19u
-#define LAR_THUNK_BASE   0x002BFF48u
-#define LAR_THUNK_COUNT  256u
-/* Retail XBE entry-point XOR key (same as FlatOut 1 / Burnout 3). */
-#define XBE_ENTRY_KEY    0xA8FC4E5Au
+#define LAR_THUNK_BASE   0x002A1620u
+#define LAR_THUNK_COUNT  144u
+/* Standard XBE retail XOR keys. */
+#define XBE_ENTRY_KEY    0xA8FC57ABu
+#define XBE_THUNK_KEY    0x5B6D40B6u
 /* Must match KERNEL_SYNTH_BASE / KDATA_BASE in larush_kernel_shim.c. */
 #define LAR_SYNTH_BASE   0x00F00000u
 #define LAR_KDATA_BASE   0x00F10000u
@@ -54,7 +60,7 @@ extern ptrdiff_t g_xbox_mem_offset;
 
 #define ST_HDR_FILE_SIZE  0x1000u
 #define ST_SEC_FILE_OFF   0x1000u
-#define ST_SEC_VA         0x002BF000u
+#define ST_SEC_VA         0x002A1000u
 #define ST_SEC_SIZE       0x2000u
 
 static int self_test_failures = 0;
@@ -76,7 +82,8 @@ static int run_self_test(void) {
     /* Header fields at the offsets the loader actually reads. */
     memcpy(img, "XBEH", 4);
     *(uint32_t *)(img + 0x104) = LAR_IMAGE_BASE;                 /* base */
-    *(uint32_t *)(img + 0x10C) = LAR_ENTRY_VA ^ XBE_ENTRY_KEY;   /* entry (encoded) */
+    *(uint32_t *)(img + 0x128) = LAR_ENTRY_VA ^ XBE_ENTRY_KEY;   /* entry (encoded) */
+    *(uint32_t *)(img + 0x158) = LAR_THUNK_BASE ^ XBE_THUNK_KEY; /* thunk addr (encoded) */
     *(uint32_t *)(img + 0x11C) = 1;                              /* section count */
     *(uint32_t *)(img + 0x120) = LAR_IMAGE_BASE + 0x200;         /* sechdr VA */
 
@@ -94,17 +101,17 @@ static int run_self_test(void) {
      * slot 1   → 1   (plain function ordinal — synthetic VA)
      * slot 2   → 165 (MmAllocateContiguousMemory — synthetic VA)
      * slot 100 → 202 (NtOpenFile — synthetic VA)
-     * slot 255 → 322 (hardware info — KDATA VA; also tests last slot) */
+     * slot 143 → 322 (hardware info — KDATA VA; also tests last slot) */
     uint32_t *thunks = (uint32_t *)(img + ST_SEC_FILE_OFF +
                                     (LAR_THUNK_BASE - ST_SEC_VA));
     thunks[0]   = 0x80000000u | 156u;
     thunks[1]   = 0x80000000u | 1u;
     thunks[2]   = 0x80000000u | 165u;
     thunks[100] = 0x80000000u | 202u;
-    thunks[255] = 0x80000000u | 322u;
+    thunks[143] = 0x80000000u | 322u;
 
     /* Decode check on the entry field, same XOR the loader will use. */
-    uint32_t entry_raw = *(uint32_t *)(img + 0x10C);
+    uint32_t entry_raw = *(uint32_t *)(img + 0x128);
     ST_CHECK((entry_raw ^ XBE_ENTRY_KEY) == LAR_ENTRY_VA,
              "entry point XOR round-trip");
 
@@ -122,15 +129,15 @@ static int run_self_test(void) {
              "slot 0 records ordinal 156");
     ST_CHECK(larush_kernel_slot_ordinal(100) == 202,
              "slot 100 records ordinal 202");
-    ST_CHECK(larush_kernel_slot_ordinal(255) == 322,
-             "slot 255 records ordinal 322");
+    ST_CHECK(larush_kernel_slot_ordinal(143) == 322,
+             "slot 143 records ordinal 322");
 
     /* Data-export ordinals must remap into the KDATA block. */
     uint32_t slot0 = MEM32(LAR_THUNK_BASE + 0 * 4);
     ST_CHECK(slot0 >= LAR_KDATA_BASE && slot0 < LAR_KDATA_BASE + 0x500,
              "ordinal 156 remapped to KDATA VA");
-    uint32_t slot255 = MEM32(LAR_THUNK_BASE + 255 * 4);
-    ST_CHECK(slot255 == LAR_KDATA_BASE + 0x000,
+    uint32_t slot143 = MEM32(LAR_THUNK_BASE + 143 * 4);
+    ST_CHECK(slot143 == LAR_KDATA_BASE + 0x000,
              "ordinal 322 remapped to hardware-info VA");
 
     /* Function ordinals must remap to their synthetic dispatch VAs. */
@@ -201,11 +208,14 @@ int main(int argc, char **argv) {
     {
         const uint8_t *xb = (const uint8_t *)xbe_data;
         uint32_t base  = *(const uint32_t *)(xb + 0x104);
-        uint32_t entry_raw = *(const uint32_t *)(xb + 0x10C);
+        uint32_t entry_raw = *(const uint32_t *)(xb + 0x128);
         uint32_t entry = entry_raw ^ XBE_ENTRY_KEY;
+        uint32_t thunk_raw = *(const uint32_t *)(xb + 0x158);
         uint32_t nsec  = *(const uint32_t *)(xb + 0x11C);
         printf("  Base:  0x%08X\n", base);
         printf("  Entry: 0x%08X (raw=0x%08X)\n", entry, entry_raw);
+        printf("  Thunk table: 0x%08X (expect 0x%08X)\n",
+               thunk_raw ^ XBE_THUNK_KEY, LAR_THUNK_BASE);
         printf("  Sections: %u (expected %u)\n", nsec, LAR_SECTIONS);
     }
 

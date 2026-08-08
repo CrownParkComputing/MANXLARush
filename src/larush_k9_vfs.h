@@ -44,9 +44,10 @@ enum {
     K9_ERR_NOT_INDEXED   = -7,  /* archive layer not yet implemented   */
 };
 
-/* Safety cap for a single decompressed payload (matches the BFS VFS
- * cap that guards against corrupt size fields). */
-#define K9_UNPACK_MAX (16u * 1024u * 1024u)
+/* Safety cap for a single decompressed payload.  Retail L.A. Rush
+ * k9CP headers declare sizes past 30 MB (land.col.k9z ≈ 0x01E55800),
+ * so this is far larger than the BFS-era 16 MB cap. */
+#define K9_UNPACK_MAX (256u * 1024u * 1024u)
 
 /* ── Layer 1: k9CP payload codec ─────────────────────────────── */
 
@@ -76,8 +77,17 @@ const char *larush_k9_magic(const larush_k9 *k9);
 /* Raw file bytes (valid for the lifetime of the handle). */
 const uint8_t *larush_k9_raw(const larush_k9 *k9, size_t *out_len);
 
-/* Number of indexed entries.  0 until the Stage B format pass. */
+/* Number of indexed entries (0 for single-file opens). */
 uint32_t larush_k9_entry_count(const larush_k9 *k9);
+
+/* Record name of entry `idx` (NULL if out of range / not a pair). */
+const char *larush_k9_entry_name(const larush_k9 *k9, uint32_t idx);
+
+/* The three sub-blocks of entry `idx` as offsets into the .res data
+ * (block 0 = info/name table, 1 = descriptors, 2 = payload).
+ * Returns 1 on success. */
+int larush_k9_entry_blocks(const larush_k9 *k9, uint32_t idx,
+                           uint32_t off[3], uint32_t size[3]);
 
 /* Lookups mirror flatout1_bfs_*: decompressed pointers are valid
  * until the next larush_k9_* call on the same handle; raw pointers

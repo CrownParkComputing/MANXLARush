@@ -165,9 +165,16 @@ int main(int argc, char **argv) {
         uint32_t entries = larush_k9_entry_count(k9);
         printf("\nArchive layer: magic \"%s\", %u indexed entries\n",
                larush_k9_magic(k9), entries);
+        for (uint32_t i = 0; i < entries; i++) {
+            uint32_t off[3], size[3];
+            larush_k9_entry_blocks(k9, i, off, size);
+            printf("  [%3u] %-32s info %6u B  desc %6u B  payload %10u B"
+                   "  @0x%08X\n",
+                   i, larush_k9_entry_name(k9, i),
+                   size[0], size[1], size[2], off[0]);
+        }
         if (entries == 0)
-            printf("(k9 entry-table format not yet decoded — "
-                   "listing/extraction lands with the Stage B format pass)\n");
+            printf("(single file — no .dir/.res entry table)\n");
 
         if (extract_one) {
             const uint8_t *data; uint32_t len;
