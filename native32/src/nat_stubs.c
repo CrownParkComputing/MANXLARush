@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 #define XSTDCALL __attribute__((stdcall))
+#define XFASTCALL __attribute__((fastcall))
 
 /* Ordinal metadata (shared table). */
 static const uint8_t s_argbytes[XK_ORDINAL_MAX + 1] = {
@@ -33,6 +34,11 @@ static const uint8_t s_argbytes[XK_ORDINAL_MAX + 1] = {
 };
 static const uint8_t s_kind[XK_ORDINAL_MAX + 1] = {
 #define X(o, n, cc, ab, k) [o] = (uint8_t)(k),
+    XK_ORDINALS(X)
+#undef X
+};
+static const uint8_t s_cc[XK_ORDINAL_MAX + 1] = {
+#define X(o, n, cc, ab, k) [o] = (uint8_t)(cc),
     XK_ORDINALS(X)
 #undef X
 };
@@ -134,7 +140,18 @@ XSTDCALL static uint32_t nk_RtlInitCS(uint32_t cs_va) {
         memset((void *)(uintptr_t)cs_va, 0, 28);
     return 0;
 }
+/* Critical sections (Enter 277 / Leave 294) as noops.  Safe while only
+ * one guest thread runs (the boot-to-GPU path), but 294 alone is called
+ * from 271 sites: once multiple guest threads contend (C3+), these must
+ * become real pthread_mutex ops keyed by the CS VA, or shared-state
+ * races corrupt guest data.  TODO before multi-threaded gameplay. */
 XSTDCALL static uint32_t nk_CS_noop(uint32_t cs_va) { (void)cs_va; return 0; }
+
+/* ── Fastcall IRQL ops (ecx/edx args, hot: 131+ sites) ─────── */
+/* KfRaiseIrql(NewIrql) returns the old IRQL; KfLowerIrql(NewIrql) void.
+ * We run at a fixed IRQL, so raise returns 0 and lower is a noop. */
+XFASTCALL static uint32_t nk_KfRaiseIrql(uint32_t new_irql) { (void)new_irql; return 0; }
+XFASTCALL static uint32_t nk_KfLowerIrql(uint32_t new_irql) { (void)new_irql; return 0; }
 
 /* ── File I/O over the k9 VFS ──────────────────────────────── */
 XSTDCALL static uint32_t nk_NtOpenFile(uint32_t handle_va, uint32_t access,
@@ -298,8 +315,29 @@ ABORT_STUB(8, uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e, uint32
 ABORT_STUB(9, uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e, uint32_t f, uint32_t g, uint32_t h, uint32_t i)
 ABORT_STUB(10, uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e, uint32_t f, uint32_t g, uint32_t h, uint32_t i, uint32_t j)
 
-static void *abort_stub_for(int argbytes) {
-    switch (argbytes / 4) {
+/* Fastcall abort stubs: first two dwords come in ecx/edx, so only args
+ * beyond 8 bytes are on the stack and callee-cleaned.  A stdcall abort
+ * stub in a fastcall slot would `ret` the wrong count and corrupt the
+ * caller's stack (KfLowerIrql alone is called from 131 sites). */
+#define FABORT_STUB(N, ...) \
+    XFASTCALL static uint32_t nkf_abort_##N(__VA_ARGS__) { \
+        stub_miss(N, __builtin_return_address(0)); return 0; }
+FABORT_STUB(0, void)
+FABORT_STUB(1, uint32_t a)
+FABORT_STUB(2, uint32_t a, uint32_t b)
+FABORT_STUB(3, uint32_t a, uint32_t b, uint32_t c)
+FABORT_STUB(4, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
+
+static void *abort_stub_for(int argbytes, int cc) {
+    int nargs = argbytes / 4;
+    if (cc == XK_FASTCALL) {
+        switch (nargs) {
+        case 0: case 1: case 2: return (void *)nkf_abort_2;  /* all in regs */
+        case 3: return (void *)nkf_abort_3;
+        default: return (void *)nkf_abort_4;
+        }
+    }
+    switch (nargs) {
     case 0: return (void *)nk_abort_0;   case 1: return (void *)nk_abort_1;
     case 2: return (void *)nk_abort_2;   case 3: return (void *)nk_abort_3;
     case 4: return (void *)nk_abort_4;   case 5: return (void *)nk_abort_5;
@@ -329,6 +367,8 @@ static void *impl_stub_for(uint32_t ord) {
     case 8:   return (void *)nk_DbgPrint;
     case 255: return (void *)nk_PsCreateSystemThreadEx;
     case 258: return (void *)nk_PsTerminateSystemThread;
+    case 160: return (void *)nk_KfRaiseIrql;   /* fastcall */
+    case 161: return (void *)nk_KfLowerIrql;   /* fastcall */
     default:  return NULL;
     }
 }
@@ -353,7 +393,11 @@ uint32_t nat_thunks_patch(const nat_xbe *xbe) {
             continue;
         }
         void *fn = impl_stub_for(ord);
-        if (!fn) fn = abort_stub_for(ord <= XK_ORDINAL_MAX ? s_argbytes[ord] : 0);
+        if (!fn) {
+            int ab = ord <= XK_ORDINAL_MAX ? s_argbytes[ord] : 0;
+            int cc = ord <= XK_ORDINAL_MAX ? s_cc[ord] : XK_STDCALL;
+            fn = abort_stub_for(ab, cc);
+        }
         GMEM32(slot) = (uint32_t)(uintptr_t)fn;
         n++;
     }
