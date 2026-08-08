@@ -1,15 +1,17 @@
 // larush_kernel_shim.c — Minimal Xbox kernel for L.A. Rush first boot.
 //
 // Based on flatout1_kernel_shim.c (itself forked from
-// burnout3_kernel_shim.c) but parameterized for L.A. Rush's kernel
-// thunk table at VA 0x002BFF48 with 256 entries.  The FlatOut init
-// table walker and hand-recompiled stubs are stripped — whether L.A.
-// Rush's entry point (0x00010184) is an init table or a direct CRT
-// entry is still an open question for the entry-path analysis pass.
+// burnout3_kernel_shim.c), parameterized for L.A. Rush's kernel thunk
+// table at VA 0x002A1620 with 144 entries (retail-confirmed; the earlier
+// 0x002BFF48/256 figures were wrong).  The entry point 0x001B2594 is
+// direct CRT code, decoded by src/larush_crt.c.
 //
-// File I/O stubs route through the k9 VFS (larush_kernel_set_k9);
-// until the k9 entry-table format is decoded, lookups fail with
-// STATUS_OBJECT_NAME_NOT_FOUND, which is the correct honest answer.
+// Ordinal metadata (name, arg-bytes, calling convention, data-vs-func)
+// comes from the authoritative xkernel_ordinals.h, generated from nxdk's
+// xboxkrnl.exe.def — not the earlier hand-derived tables, which mislabeled
+// several ordinals (notably NtReadFile as 210; it is 219).
+//
+// File I/O stubs route through the k9 VFS (larush_kernel_set_k9).
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -19,6 +21,47 @@
 #include <stdlib.h>
 
 #include "larush_k9_vfs.h"
+#include "xkernel_ordinals.h"
+
+/* Authoritative ordinal metadata, generated from nxdk's
+ * xboxkrnl.exe.def (see xkernel_ordinals.h).  Replaces the hand-derived
+ * kernel_arg_bytes()/name tables, which carried several off-by-one
+ * errors (e.g. NtReadFile mapped to ordinal 210 — actually
+ * NtQueryFullAttributesFile; real NtReadFile is 219). */
+static const char *const s_ord_name[XK_ORDINAL_MAX + 1] = {
+#define X(o, n, cc, ab, k) [o] = #n,
+    XK_ORDINALS(X)
+#undef X
+};
+static const uint8_t s_ord_argbytes[XK_ORDINAL_MAX + 1] = {
+#define X(o, n, cc, ab, k) [o] = (uint8_t)(ab),
+    XK_ORDINALS(X)
+#undef X
+};
+static const uint8_t s_ord_cc[XK_ORDINAL_MAX + 1] = {
+#define X(o, n, cc, ab, k) [o] = (uint8_t)(cc),
+    XK_ORDINALS(X)
+#undef X
+};
+static const uint8_t s_ord_kind[XK_ORDINAL_MAX + 1] = {
+#define X(o, n, cc, ab, k) [o] = (uint8_t)(k),
+    XK_ORDINALS(X)
+#undef X
+};
+
+const char *xk_ordinal_name(uint32_t ord) {
+    return (ord <= XK_ORDINAL_MAX && s_ord_name[ord]) ? s_ord_name[ord]
+                                                      : "?";
+}
+int xk_ordinal_argbytes(uint32_t ord) {
+    return ord <= XK_ORDINAL_MAX ? s_ord_argbytes[ord] : 0;
+}
+int xk_ordinal_is_data(uint32_t ord) {
+    return ord <= XK_ORDINAL_MAX && s_ord_kind[ord] == XK_DATA;
+}
+int xk_ordinal_cc(uint32_t ord) {
+    return ord <= XK_ORDINAL_MAX ? s_ord_cc[ord] : XK_NONE;
+}
 
 /* Xbox memory macros — inlined here because recomp_types.h pulls in
  * __forceinline and other MSVC constructs that fail under GCC. */
@@ -503,55 +546,24 @@ static void kernel_data_init(void) {
 
 typedef void (*recomp_func_t)(void);
 
+/* Stdcall bytes-to-pop, from the authoritative export table. */
 static int kernel_arg_bytes(uint32_t ordinal) {
-    switch (ordinal) {
-    case 1: case 8: case 23: case 42: case 126: case 127: case 129:
-    case 160: case 161: case 238: case 250: case 358: case 360: return 0;
-    case 4: case 15: case 24: case 40: case 49: case 69: case 97:
-    case 99: case 100: case 124: case 128: case 137: case 139: case 142:
-    case 151: case 165: case 171: case 173: case 179: case 180: case 181:
-    case 187: case 195: case 258: case 277: case 291: case 294: case 301:
-    case 302: case 345: case 359: return 4;
-    case 16: case 41: case 44: case 46: case 83: case 113: case 143:
-    case 168: case 169: case 170: case 176: case 198: case 203:
-    case 225: case 228: case 253: case 289: case 304: case 305: case 339:
-    case 353: return 8;
-    case 74: case 84: case 107: case 119: case 145: case 153: case 175:
-    case 177: case 178: case 182: case 197: case 215: case 222: case 234:
-    case 246: case 256: case 260: case 269: case 279: case 308: case 335:
-    case 336: case 338: case 340: case 344: case 346: case 349: case 354: return 12;
-    case 2: case 85: case 149: case 189: case 193: case 217: case 312: return 16;
-    case 86: case 98: case 150: case 159: case 166: case 184: case 211:
-    case 218: case 226: case 247: case 347: return 20;
-    case 3: case 47: return 24;
-    case 109: return 28;
-    case 62: case 190: case 207: case 210: return 36;
-    case 158: case 219: case 236: return 32;
-    case 67: case 196: case 200: case 255: return 40;
-    /* Ordinals first seen in FlatOut 1's init table (value-only). */
-    case 81: case 87: return 0;
-    /* L.A. Rush ordinals beyond the Burnout 3 set (first boot scan:
-     * 17/65 are data exports, 202/277/289 have stubs above).  Arg
-     * byte counts TBD from disassembly of the call sites. */
-    case 37: case 95: case 167: case 172: case 186: case 199:
-    case 233: case 252: case 270: case 337: return 0;
-    default: return 0;
-    }
+    return xk_ordinal_argbytes(ordinal);
 }
 
 static recomp_func_t kernel_stub_for_ordinal(uint32_t ordinal) {
     switch (ordinal) {
-    case 15:  return stub_ExAllocatePool;
-    case 16:  return stub_ExAllocatePoolWithTag;
-    case 24:  return stub_ExQueryPoolBlockSize;
+    case 14:  return stub_ExAllocatePool;         /* @4  */
+    case 15:  return stub_ExAllocatePoolWithTag;  /* @8  */
+    case 23:  return stub_ExQueryPoolBlockSize;   /* @4  */
     case 165: return stub_MmAllocateContiguousMemory;
     case 166: return stub_MmAllocateContiguousMemoryEx;
-    case 171: return stub_ExFreePool;
+    case 17:  return stub_ExFreePool;             /* @4  */
     case 187: return stub_NtClose;
     case 190: return stub_NtCreateFile;
     case 197: return stub_NtDuplicateObject;
-    case 202: return stub_NtOpenFile;
-    case 210: return stub_NtReadFile;
+    case 202: return stub_NtOpenFile;             /* @24 */
+    case 219: return stub_NtReadFile;             /* @32 — NOT 210 */
     case 218: return stub_NtQueryVolumeInformationFile;
     case 277:
     case 294: return stub_RtlCriticalSectionNoop;
@@ -578,12 +590,13 @@ static void kernel_thunk_dispatch(void) {
     call_count++;
 
     if (call_count <= 80) {
-        fprintf(stderr, "  [LARUSH-KERN] #%u ordinal %u slot %d esp=0x%08X%s\n",
-                call_count, ordinal, slot, g_esp, stub ? "" : " (STUBBED)");
+        fprintf(stderr, "  [LARUSH-KERN] #%u %s (ord %u) slot %d esp=0x%08X%s\n",
+                call_count, xk_ordinal_name(ordinal), ordinal, slot, g_esp,
+                stub ? "" : " (STUBBED)");
     } else if (!stub && !warned[slot]) {
         warned[slot] = true;
-        fprintf(stderr, "  [LARUSH-KERN] ordinal %u slot %d is a value-only stub\n",
-                ordinal, slot);
+        fprintf(stderr, "  [LARUSH-KERN] %s (ord %u) slot %d is a value-only stub\n",
+                xk_ordinal_name(ordinal), ordinal, slot);
     }
 
     if (stub) stub();
