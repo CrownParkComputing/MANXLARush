@@ -53,7 +53,7 @@ target_link_libraries(LARushCRTTest PRIVATE larush_port)
 
 add_executable(LARushGameLoop tools/larush_game_loop.c)
 target_include_directories(LARushGameLoop PRIVATE tools)
-target_link_libraries(LARushGameLoop PRIVATE larush_port SDL3::SDL3)
+target_link_libraries(LARushGameLoop PRIVATE larush_port SDL3::SDL3 m)
 
 enable_testing()
 add_executable(larush_k9_unit_test tests/larush_k9_unit_test.c)

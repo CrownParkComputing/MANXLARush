@@ -23,6 +23,7 @@
 #include "larush_k9_vfs.h"
 #include "k9_texture.h"
 
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -52,6 +53,96 @@ typedef struct {
 static art_slot s_art[MAX_ART];
 static int s_art_count = 0;
 static int s_current = 0;
+static int s_show_car = 0;       /* garage state active this frame */
+
+/* ── car mesh (k9 cars archive) ────────────────────────────────
+ *
+ * Car entry descriptor blocks mix 20-byte D3DTexture records with
+ * 12-byte {Common=0x00800001, DataOffset, Lock=0} vertex/index buffer
+ * records.  Vertex buffers are stride-20: int16 x,y,z position in
+ * ~millimetres at offset 0 (verified: coherent buffers reassemble a
+ * ~2.9 m car silhouette), then packed normal/uv/colour dwords.
+ * Buffers whose positions aren't coherent are index/aux data — the
+ * 98 %-inlier filter drops them. */
+
+typedef struct { float x, y, z; } car_vtx;
+
+static car_vtx *s_car = NULL;
+static uint32_t s_car_count = 0;
+static char s_car_name[24] = "";
+
+static void load_car(larush_k9 *k9, const char *want) {
+    uint32_t idx = (uint32_t)-1;
+    for (uint32_t i = 0; i < larush_k9_entry_count(k9); i++) {
+        const char *nm = larush_k9_entry_name(k9, i);
+        if (nm && strcmp(nm, want) == 0) { idx = i; break; }
+    }
+    if (idx == (uint32_t)-1) {
+        fprintf(stderr, "car \"%s\" not in archive\n", want);
+        return;
+    }
+    uint32_t off[3], size[3];
+    const uint8_t *entry; uint32_t entry_len;
+    if (!larush_k9_entry_blocks(k9, idx, off, size)) return;
+    if (!larush_k9_find_by_index(k9, idx, &entry, &entry_len)) return;
+    const uint8_t *desc    = entry + (off[1] - off[0]);
+    const uint8_t *payload = entry + (off[2] - off[0]);
+
+    /* Collect buffer start offsets from the 12-byte records. */
+    uint32_t starts[256]; int nstarts = 0;
+    uint32_t p = 0;
+    while (p + 12 <= size[1] && nstarts < 255) {
+        uint32_t common, data, lock;
+        memcpy(&common, desc + p + 0, 4);
+        memcpy(&data,   desc + p + 4, 4);
+        memcpy(&lock,   desc + p + 8, 4);
+        if (common == 0x00800001u && lock == 0 && data < size[2]) {
+            starts[nstarts++] = data;
+            p += 12;
+        } else if ((common & 0x00070000u) == 0x00040000u) {
+            p += 20;
+        } else {
+            p += 4;
+        }
+    }
+    /* Sort ascending; sizes are the gaps. */
+    for (int i = 1; i < nstarts; i++)
+        for (int j = i; j > 0 && starts[j] < starts[j-1]; j--) {
+            uint32_t t = starts[j]; starts[j] = starts[j-1];
+            starts[j-1] = t;
+        }
+    starts[nstarts] = size[2];
+
+    car_vtx *vts = malloc(sizeof(car_vtx) * (size[2] / 20 + 1));
+    if (!vts) return;
+    uint32_t n = 0;
+    for (int b = 0; b < nstarts; b++) {
+        uint32_t bo = starts[b], bs = starts[b+1] - starts[b];
+        if (bs % 20 || bs < 400) continue;
+        uint32_t bn = bs / 20, inlier = 0;
+        for (uint32_t i = 0; i < bn; i++) {
+            int16_t v[3];
+            memcpy(v, payload + bo + i * 20, 6);
+            if (v[0] > -4000 && v[0] < 4000 && v[1] > -4000 &&
+                v[1] < 4000 && v[2] > -4000 && v[2] < 4000)
+                inlier++;
+        }
+        if (inlier * 100 < bn * 98) continue;
+        for (uint32_t i = 0; i < bn; i++) {
+            int16_t v[3];
+            memcpy(v, payload + bo + i * 20, 6);
+            vts[n].x = (float)v[0] / 1000.0f;
+            vts[n].y = (float)v[1] / 1000.0f;
+            vts[n].z = (float)v[2] / 1000.0f;
+            n++;
+        }
+    }
+    s_car = vts;
+    s_car_count = n;
+    snprintf(s_car_name, sizeof(s_car_name), "car %s", want);
+    printf("garage: car \"%s\", %u vertices from %d buffers\n",
+           want, n, nstarts);
+}
 
 /* ── CPU compositor (shared by SDL upload and --dump) ──────── */
 
@@ -64,12 +155,46 @@ static uint32_t s_fb[FB_W * FB_H];
     (((uint32_t)(a) << 24) | ((uint32_t)(b) << 16) | \
      ((uint32_t)(g) <<  8) | (uint32_t)(r))
 
+/* Rotating point-cloud render of the car mesh. */
+static void draw_car(uint32_t frame) {
+    float ang = (float)frame * 0.025f;
+    float ca = cosf(ang), sa = sinf(ang);
+    for (uint32_t i = 0; i < s_car_count; i++) {
+        float x = s_car[i].x, y = s_car[i].y, z = s_car[i].z;
+        float rx = x * ca - z * sa;
+        float rz = x * sa + z * ca;
+        float cz = rz + 4.2f;                 /* camera distance */
+        if (cz < 0.5f) continue;
+        int px = FB_W / 2 + (int)(rx * 620.0f / cz);
+        int py = FB_H / 2 + 30 - (int)((y + 0.10f) * 620.0f / cz);
+        if (px < 1 || px >= FB_W - 1 || py < 1 || py >= FB_H - 1)
+            continue;
+        /* Depth-shaded body colour (near = bright). */
+        float d = (4.2f + 1.6f - cz) / 2.6f;
+        if (d < 0.35f) d = 0.35f;
+        if (d > 1.0f) d = 1.0f;
+        uint32_t c = ABGR((uint8_t)(255 * d), (uint8_t)(150 * d),
+                          (uint8_t)(60 * d), 0xFF);
+        s_fb[py * FB_W + px] = c;             /* 2×2 splat */
+        s_fb[py * FB_W + px + 1] = c;
+        s_fb[(py + 1) * FB_W + px] = c;
+        s_fb[(py + 1) * FB_W + px + 1] = c;
+    }
+    /* Ground line */
+    int gy = FB_H / 2 + 30 + (int)(0.32f * 620.0f / 4.2f);
+    if (gy > 0 && gy < FB_H)
+        for (int x = 40; x < FB_W - 40; x++)
+            s_fb[gy * FB_W + x] = ABGR(0x40, 0x28, 0x30, 0xFF);
+}
+
 static void compose_frame(void) {
     uint32_t frame = MEM32(0x00340B70u);
     for (int i = 0; i < FB_W * FB_H; i++)
         s_fb[i] = ABGR(0x18, 0x0A, 0x1E, 0xFF);
 
-    if (s_art_count) {
+    if (s_show_car && s_car_count) {
+        draw_car(frame);
+    } else if (s_art_count) {
         const art_slot *a = &s_art[s_current];
         /* Letterbox-fit nearest-neighbour blit. */
         int dw = FB_W, dh = FB_W * a->h / a->w;
@@ -111,9 +236,13 @@ static int write_ppm(const char *path) {
 /* ── render native (0x000EA4A0) ────────────────────────────── */
 
 static void native_render_scene(void) {
+    uint32_t frame = MEM32(0x00340B70u);
+    /* Attract cycle: 180 frames in the garage (rotating car), then
+     * 180 frames of frontend art, repeating. */
+    uint32_t cycle = frame % 360u;
+    s_show_car = s_car_count && cycle < 180u;
     if (s_art_count)
-        s_current = (int)(MEM32(0x00340B70u) / FRAMES_PER_ART)
-                    % s_art_count;
+        s_current = (int)(frame / FRAMES_PER_ART) % s_art_count;
 }
 
 /* ── present native (0x000E8E10): two backends ─────────────── */
@@ -122,14 +251,15 @@ static const char *s_dump_prefix = NULL;
 
 static void native_present_dump(void) {
     uint32_t frame = MEM32(0x00340B70u);
-    static const uint32_t snaps[] = { 0, 95, 185, 275, 365 };
+    static const uint32_t snaps[] = { 30, 80, 130, 200, 275, 365 };
     for (unsigned i = 0; i < sizeof(snaps) / sizeof(*snaps); i++) {
         if (frame == snaps[i]) {
             compose_frame();
             char path[1024];
             snprintf(path, sizeof(path), "%s_f%03u.ppm",
                      s_dump_prefix, frame);
-            printf("frame %3u: art \"%s\" -> %s\n", frame,
+            printf("frame %3u: %s -> %s\n", frame,
+                   s_show_car ? s_car_name :
                    s_art_count ? s_art[s_current].name : "-", path);
             write_ppm(path);
         }
@@ -193,12 +323,15 @@ static void load_art(larush_k9 *k9) {
 
 int main(int argc, char **argv) {
     const char *data_dir = "game_data/L.A.Rush.USA.XBOX-ZTM";
+    const char *car_name = "01";
     uint32_t frames = 0;                    /* 0 = until window close */
     for (int a = 1; a < argc; a++) {
         if (strcmp(argv[a], "--frames") == 0 && a + 1 < argc)
             frames = (uint32_t)strtoul(argv[++a], NULL, 0);
         else if (strcmp(argv[a], "--dump") == 0 && a + 1 < argc)
             s_dump_prefix = argv[++a];
+        else if (strcmp(argv[a], "--car") == 0 && a + 1 < argc)
+            car_name = argv[++a];
         else
             data_dir = argv[a];
     }
@@ -234,6 +367,14 @@ int main(int argc, char **argv) {
     } else {
         fprintf(stderr, "warning: no frontend archive — blank frames\n");
     }
+
+    /* Car mesh for the garage state */
+    larush_k9 *cars = NULL;
+    snprintf(path, sizeof(path),
+             "%s/COMPRESSED_Cars/cars.dir.k9z", data_dir);
+    cars = larush_k9_open(path);
+    if (cars)
+        load_car(cars, car_name);
 
     /* Wire the natives and run the chain. */
     larush_game_main_register();
@@ -277,6 +418,8 @@ int main(int argc, char **argv) {
     if (!s_dump_prefix) SDL_Quit();
 #endif
     for (int i = 0; i < s_art_count; i++) free(s_art[i].rgba);
+    free(s_car);
+    if (cars) larush_k9_close(cars);
     if (k9) larush_k9_close(k9);
     larush_kernel_shutdown();
     xbox_MemoryLayoutShutdown();
