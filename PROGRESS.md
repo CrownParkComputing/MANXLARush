@@ -1,10 +1,43 @@
 # L.A. Rush — Native recompilation progress
 
-**Updated:** 8 August 2026 (second pass)
-**Primary milestone:** render retail L.A. Rush art via the shared D3D8→Vulkan
-backend, loading assets from the k9 archives.
+**Updated:** 8 August 2026 (Stage C pass)
+**Primary milestone:** run the retail XBE's x86 code natively (no emulation)
+with kernel HLE, displaying through dxvk-native D3D8.
 
-## Current status
+## Stage C — native execution (NEW, headline result)
+
+The retail XBE is 32-bit Pentium III code this host runs directly, so
+`native32/LARushNative` (a 32-bit ELF) loads the game at its true VAs and
+**executes the real code natively** rather than recompiling it by hand.
+
+**As of the C1.e milestone, the game boots natively all the way to the
+GPU:** entry `0x001B2594` → `PsCreateSystemThreadEx` → CRT trampoline
+`0x1B74BF` → `mainCRTStartup` → **all 2,228 static constructors** →
+`main`'s init → Direct3D device creation, faulting exactly at NV2A
+register `0xFD001804` — the D3D8 boundary.  Eleven kernel ordinals fire
+during boot, all benign (timers/events/DPCs/contiguous memory).
+
+Pieces (see the Stage C plan / `native32/src`):
+- `nat_arena.c` — identity-map the 64 MB arena at `0x10000`; XBE loader
+  (header page + sections at true VAs; kernel-thunk XOR key `0x5B6D40B6`);
+  fake kernel window at `0x80000000` so the CRT build-probe skips.
+- `xkernel_ordinals.h` — authoritative export table from nxdk's
+  `xboxkrnl.exe.def`; fixed inherited off-by-one ordinals (NtReadFile is
+  219 not 210; ExAllocatePool is 14; etc.).
+- `nat_stubs.c` — real i386 `__stdcall` kernel stubs on the guest stack;
+  k9-backed file I/O; page-bump VM alloc; thunk patcher (FUNC→stub,
+  DATA→KDATA, else arity-correct log-once stub that names itself).
+- `nat_thread.c` — `PsCreateSystemThreadEx`→pthreads with per-thread
+  KPCR/`%fs` (`set_thread_area`) and the CRT's TLS geometry.
+- `nat_signals.c` — skip `cli/sti/wbinvd`; classified fault dumps.
+
+Build: `cmake -S . -B build -DLARUSH_BUILD_NATIVE32=ON`.
+Run: `./build/native32/LARushNative --run game_data/L.A.Rush.USA.XBOX-ZTM`.
+
+**Next: C2** (formal XbSymbolDatabase D3D-call trace) then **C3** (bridge
+the D3D8 calls to dxvk-native for a real rendered frame).
+
+## Current status (Stage A/B hand-recompile track)
 
 Stage A **and** the first Stage B pass are complete against the retail
 `L.A.Rush.USA.XBOX-ZTM` image.  The XBE boots to 144/144 kernel thunks
