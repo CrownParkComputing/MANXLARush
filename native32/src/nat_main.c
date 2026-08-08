@@ -9,6 +9,7 @@
 
 #include "nat_arena.h"
 #include "nat_fs.h"
+#include "nat_stubs.h"
 #include "larush_k9_vfs.h"
 
 #include <stdio.h>
@@ -99,16 +100,71 @@ static int load_mode(const char *data_dir) {
     return s_fail;
 }
 
+/* Find the thunk slot carrying `ordinal` (scans the pre-patch table). */
+static uint32_t slot_va_for_ordinal(uint32_t thunk_va, uint32_t ordinal) {
+    for (uint32_t i = 0; i < 144; i++) {
+        uint32_t v = GMEM32(thunk_va + i * 4u);
+        if ((v & 0x80000000u) && (v & 0x7FFFFFFFu) == ordinal)
+            return thunk_va + i * 4u;
+    }
+    return 0;
+}
+
+typedef uint32_t (__attribute__((stdcall)) *fn2_t)(uint32_t, uint32_t);
+
+/* --thunks <data_dir>: load, patch the 144 slots, then call a real stub
+ * (ExAllocatePoolWithTag, ord 15) *through its patched slot* — proving
+ * guest `call [slot]` reaches host stdcall code with correct args and
+ * stack cleanup. */
+static int thunks_mode(const char *data_dir) {
+    printf("LARushNative --thunks %s (Stage C1.d)\n", data_dir);
+    if (nat_arena_reserve() != 0) return 1;
+    nat_xbe xbe;
+    if (nat_load_xbe(data_dir, &xbe) != 0) return 1;
+
+    /* Record slots we will exercise BEFORE patching overwrites ordinals. */
+    uint32_t slot_alloc = slot_va_for_ordinal(xbe.thunk_va, 15);  /* ExAllocatePoolWithTag */
+    uint32_t slot_data  = slot_va_for_ordinal(xbe.thunk_va, 16);  /* ExEventObjectType (DATA) */
+
+    uint32_t patched = nat_thunks_patch(&xbe);
+    s_fail = 0;
+    CHECK(patched == 144, "patched all 144 thunk slots");
+    CHECK(slot_alloc != 0, "found ExAllocatePoolWithTag slot (ord 15)");
+    CHECK(slot_data != 0, "found ExEventObjectType slot (ord 16, DATA)");
+
+    /* DATA export slot now points into the KDATA region. */
+    if (slot_data)
+        CHECK(GMEM32(slot_data) >= NAT_KDATA_BASE,
+              "DATA slot points at KDATA cell");
+
+    /* Call ExAllocatePoolWithTag through the patched slot. */
+    if (slot_alloc) {
+        fn2_t fn = (fn2_t)(uintptr_t)GMEM32(slot_alloc);
+        uint32_t va = fn(0x400, 0x74736574 /* 'test' */);
+        CHECK(va >= NAT_HEAP_BASE && va < NAT_HEAP_END,
+              "guest call [slot] -> ExAllocatePoolWithTag returned heap VA");
+        /* Second call returns a distinct, higher address. */
+        uint32_t va2 = fn(0x10, 0);
+        CHECK(va2 >= va + 0x400, "second alloc advances the bump heap");
+    }
+
+    printf(s_fail ? "\nTHUNKS FAILED\n" : "\nThunk patch + dispatch verified.\n");
+    return s_fail;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "--self-test") == 0)
         return self_test();
     if (argc > 2 && strcmp(argv[1], "--load") == 0)
         return load_mode(argv[2]);
+    if (argc > 2 && strcmp(argv[1], "--thunks") == 0)
+        return thunks_mode(argv[2]);
 
     fprintf(stderr,
-        "LARushNative: native-execution harness (Stage C1.c)\n"
-        "  --self-test        verify arena + %%fs + k9 codec\n"
-        "  --load <data_dir>  load the XBE at true VAs and verify\n"
-        "Thunk patch, threads and probes arrive in C1.d-f.\n");
+        "LARushNative: native-execution harness (Stage C1.d)\n"
+        "  --self-test         verify arena + %%fs + k9 codec\n"
+        "  --load <data_dir>   load the XBE at true VAs and verify\n"
+        "  --thunks <data_dir> patch thunks + call a stub through a slot\n"
+        "Threads and probes arrive in C1.e-f.\n");
     return 2;
 }
